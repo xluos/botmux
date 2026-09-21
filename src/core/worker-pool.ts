@@ -674,7 +674,7 @@ import {
   readScheduledTaskForProvenance,
   trustedCallerForScheduledTask,
 } from './scheduled-turn-provenance.js';
-import { isTriggerFinalSuppressed } from './trigger-final-suppression.js';
+import { inheritActiveTurnFinalSuppression, isTriggerFinalSuppressed } from './trigger-final-suppression.js';
 import { writeDeferredTopicBinding } from './deferred-topic-binding.js';
 import {
   currentDeviceIsolationFreezeLease,
@@ -12310,6 +12310,9 @@ function setupWorkerHandlers(
     }
     const effectiveCliId = sessionCliId(ds, botCfg);
     switch (msg.type) {
+      case 'active_turn_envelope_changed':
+        inheritActiveTurnFinalSuppression(ds, msg.previousTurnId, msg.turnId);
+        break;
       case 'worker_ipc_ready':
         // Consumed by the standalone bootstrap listener installed at spawn.
         break;

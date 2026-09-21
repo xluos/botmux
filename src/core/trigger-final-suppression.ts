@@ -109,3 +109,16 @@ export function armProjectPeerFinalSuppression(
   if (ds.scope !== 'chat' || !input.foreignBot || !input.projectMode || !input.turnId) return;
   armTriggerFinalSuppression(ds, input.turnId);
 }
+
+/** Carry internal-result isolation across a worker-confirmed live interruption.
+ * Keep the source entry for trailing events; later independent turns receive
+ * no inheritance event and retain their ordinary reply behavior. */
+export function inheritActiveTurnFinalSuppression(
+  ds: DaemonSession,
+  previousTurnId: string,
+  turnId: string,
+): void {
+  if (isTriggerFinalSuppressed(ds, previousTurnId)) {
+    armTriggerFinalSuppression(ds, turnId);
+  }
+}

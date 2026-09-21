@@ -1,10 +1,12 @@
 import { describe, expect, it } from 'vitest';
+import { ActiveTurnAuthority } from '../src/core/active-turn-authority.js';
 
 import {
   armTriggerFinalSuppression,
   armProjectPeerFinalSuppression,
   disarmTriggerFinalSuppression,
   inheritTriggerReplyAnchor,
+  inheritActiveTurnFinalSuppression,
   isTriggerFinalSuppressed,
 } from '../src/core/trigger-final-suppression.js';
 import { resolveSessionReplyTarget } from '../src/core/reply-target.js';
@@ -150,5 +152,85 @@ describe('project peer final fallback', () => {
     const ds = { scope: input.scope } as DaemonSession;
     armProjectPeerFinalSuppression(ds, input);
     expect(ds.suppressedTriggerFinalTurns).toBeUndefined();
+  });
+});
+
+
+describe('internal task interrupted by ordinary IM input', () => {
+  it.each(['same-caller', 'cross-caller'] as const)('keeps receipts internal through %s interruptions and restores later chat', mode => {
+    const ds = session();
+    const authority = new ActiveTurnAuthority((previous, next) => {
+      inheritActiveTurnFinalSuppression(ds, previous, next);
+    });
+    const caller = { requestUserOpenId: 'ou_owner', requestLarkAppId: 'cli_test', senderType: 'user' as const };
+    const internal = { turnId: 'trg_deployment', caller };
+    armTriggerFinalSuppression(ds, internal.turnId);
+    authority.reserve(internal);
+    authority.markStarted(internal);
+
+    for (const turnId of ['om_build_retriggered', 'om_followup']) {
+      const steer = { turnId, caller: mode === 'same-caller' ? caller : { ...caller, requestUserOpenId: 'ou_other' } };
+      if (mode === 'cross-caller') authority.adoptEnvelopePreservingPrincipal(steer);
+      else authority.reserve(steer);
+      authority.markStarted(steer);
+      expect(authority.identity().turnId).toBe(turnId);
+      expect(isTriggerFinalSuppressed(ds, turnId)).toBe(true);
+    }
+    authority.releaseExact({ turnId: 'om_followup' });
+    // A terminal may precede its trailing bridge final.
+    expect(isTriggerFinalSuppressed(ds, 'om_followup')).toBe(true);
+    expect(isTriggerFinalSuppressed(ds, internal.turnId)).toBe(true);
+    authority.reserve({ turnId: 'om_new_question' });
+    authority.markStarted({ turnId: 'om_new_question' });
+    expect(isTriggerFinalSuppressed(ds, 'om_new_question')).toBe(false);
+  });
+
+  it('retains isolation across consecutive adoptions before submission', () => {
+    const ds = session();
+    const authority = new ActiveTurnAuthority((previous, next) => inheritActiveTurnFinalSuppression(ds, previous, next));
+    armTriggerFinalSuppression(ds, 'trg_task');
+    authority.reserve({ turnId: 'trg_task' });
+    authority.markStarted({ turnId: 'trg_task' });
+    authority.adoptEnvelopePreservingPrincipal({ turnId: 'om_one' });
+    authority.adoptEnvelopePreservingPrincipal({ turnId: 'om_two' });
+    authority.markStarted({ turnId: 'om_two' });
+    expect(isTriggerFinalSuppressed(ds, 'om_two')).toBe(true);
+  });
+
+  it('does not pass isolation from unstarted reservations or completed tasks', () => {
+    const ds = session();
+    const authority = new ActiveTurnAuthority((previous, next) => inheritActiveTurnFinalSuppression(ds, previous, next));
+    armTriggerFinalSuppression(ds, 'trg_reserved');
+    authority.reserve({ turnId: 'trg_reserved' });
+    authority.markStarted({ turnId: 'om_first' });
+    expect(isTriggerFinalSuppressed(ds, 'om_first')).toBe(false);
+    authority.clear();
+    authority.reserve({ turnId: 'om_next' });
+    authority.markStarted({ turnId: 'om_next' });
+    expect(isTriggerFinalSuppressed(ds, 'om_next')).toBe(false);
+  });
+
+  it('does not inherit into an input queued until the active task finishes', () => {
+    const ds = session();
+    const authority = new ActiveTurnAuthority((previous, next) => inheritActiveTurnFinalSuppression(ds, previous, next));
+    armTriggerFinalSuppression(ds, 'trg_task');
+    authority.reserve({ turnId: 'trg_task' });
+    authority.markStarted({ turnId: 'trg_task' });
+    const queued = { turnId: 'om_queued', queueAfterActiveTurn: true as const };
+    expect(authority.reserve(queued)).toBe(false);
+    expect(authority.markStarted(queued)).toBe(false);
+    authority.releaseExact({ turnId: 'trg_task' });
+    expect(authority.reserve(queued)).toBe(true);
+    expect(authority.markStarted(queued)).toBe(true);
+    expect(isTriggerFinalSuppressed(ds, 'om_queued')).toBe(false);
+  });
+
+  it('keeps ordinary interrupted chat visible', () => {
+    const ds = session();
+    const authority = new ActiveTurnAuthority((previous, next) => inheritActiveTurnFinalSuppression(ds, previous, next));
+    authority.reserve({ turnId: 'om_chat' });
+    authority.markStarted({ turnId: 'om_chat' });
+    authority.adoptEnvelopePreservingPrincipal({ turnId: 'om_correction' });
+    expect(isTriggerFinalSuppressed(ds, 'om_correction')).toBe(false);
   });
 });
