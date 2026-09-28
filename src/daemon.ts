@@ -23206,6 +23206,7 @@ async function handleThreadReplyAdmitted(
   // 「哪些消息算纯文字答复」收口在 askCustomReplyCandidate（含带资源消息与 grill
   // 触发的排除理由），拦截器这里只负责拿着结果去 settle。
   const askCandidate = askCustomReplyCandidate({
+    humanSender: parsed.senderType === 'user' && !isForeignBot,
     senderOpenId: threadSenderOpenId,
     chatId: threadChatId,
     cmdContent,
@@ -23234,11 +23235,8 @@ async function handleThreadReplyAdmitted(
         askId: pendingAsk.askId,
         by: askCandidate.senderOpenId,
         text: askCandidate.text,
-        // Actor context so the broker's talk check uses the same predicate as
-        // the dispatcher gate / quota recheck: a bot text-reply → evaluateBotTalk
-        // (covers team-拉群 with no union_id), a platform teamMember human →
-        // evaluateTalk's teamMember union leg. Omitting it (card clicks) degrades
-        // to the plain evaluateTalk(openId, chatType).
+        // Preserve authenticated human identity for the broker's talk check.
+        // Peer messages retain normal routing and cannot settle this Ask.
         actor: {
           botSender: isBotSenderType || isForeignBot,
           senderUnionId: threadTeamTrustUnionId,

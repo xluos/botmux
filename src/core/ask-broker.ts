@@ -643,9 +643,8 @@ export function submitAsk(args: {
  * 不需要 nonce：调用方（daemon 消息路由）用 `findPendingAskByAnchor` 从在线
  * pending 表按话题 anchor 查到 askId，本身就排除了「重启后的陈旧卡片」场景。
  *
- * `actor`：文字作答路径拿得到完整消息事件，把 bot / union context 传进来，让 talk
- * 判定与 dispatcher 外层闸 / quota 复查同源（bot → evaluateBotTalk，人 → evaluateTalk
- * 的 teamMember union 腿）。不传则退化为纯 open_id 判定（与卡片点击一致）。
+ * `actor`：文字作答路径传入真实消息身份；机器人不能提交真人 Ask。真人仍使用
+ * evaluateTalk 的 teamMember union 权限，不传时使用 open_id 判定（与卡片点击一致）。
  *
  * 成功返回 `'accepted'`；非法返回对应 AskClickOutcome。
  */
@@ -659,6 +658,8 @@ export function submitCustomReply(args: {
   const ask = pending.get(args.askId);
   if (!ask) return 'stale';
   if (ask.settled) return 'already_settled';
+  // Permission to talk does not authorize a bot to answer a human Ask.
+  if (args.actor?.botSender) return 'unauthorized';
   if (!isAuthorizedToAnswer(ask, args.by, args.actor)) return 'unauthorized';
   const text = args.text.trim();
   if (!text) return 'stale';

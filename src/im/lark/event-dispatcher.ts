@@ -2129,6 +2129,7 @@ export interface AskCustomReplyCandidate {
  *  - workflow grill 触发（`/workflow [new] <目标>`）不吞：grill 分支只改写
  *    promptContent 后 fall-through，cmdContent 仍是字面量，被吞掉 grill 就永远
  *    不启动。
+ *  - 只有已确认的真人发送者可作答；机器人和身份未知消息保留正常路由。
  *  - 没有 senderOpenId / chatId 时不吞：答复权限与 ask 归属都无从判定。
  *
  * 抽成导出谓词（而非把条件内联进 daemon）的意义与 {@link evaluateAskAnswerTalk}
@@ -2136,13 +2137,15 @@ export interface AskCustomReplyCandidate {
  * canTalkChecker 判定，本函数不涉及权限。
  */
 export function askCustomReplyCandidate(input: {
+  /** Authenticated event identity; unknown senders keep normal message routing. */
+  humanSender: boolean;
   senderOpenId: string | undefined;
   chatId: string | undefined;
   cmdContent: string;
   resourceCount: number;
   isWorkflowGrillTrigger: boolean;
 }): AskCustomReplyCandidate | undefined {
-  if (!input.senderOpenId || !input.chatId) return undefined;
+  if (!input.humanSender || !input.senderOpenId || !input.chatId) return undefined;
   if (input.isWorkflowGrillTrigger) return undefined;
   if (input.resourceCount > 0) return undefined;
   const text = input.cmdContent.trim();

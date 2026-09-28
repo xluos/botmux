@@ -24,6 +24,7 @@ function candidateFor(
   overrides: Partial<Parameters<typeof askCustomReplyCandidate>[0]> = {},
 ): ReturnType<typeof askCustomReplyCandidate> {
   return askCustomReplyCandidate({
+    humanSender: true,
     senderOpenId: SENDER,
     chatId: CHAT,
     cmdContent: '确认归档 ATLAS-30',
@@ -88,4 +89,8 @@ describe('askCustomReplyCandidate — 待答 ask 的自定义回复拦截判据'
     expect(candidateFor({ senderOpenId: undefined })).toBeUndefined();
     expect(candidateFor({ chatId: undefined })).toBeUndefined();
   });
+});
+
+it('机器人和身份未知的消息保留正常路由，不消费真人 Ask', () => {
+  expect(candidateFor({ humanSender: false })).toBeUndefined();
 });
