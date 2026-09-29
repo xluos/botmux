@@ -6,6 +6,8 @@
  */
 
 import type { AskOption, AskQuestion } from './ask-types.js';
+import { parseOption, parseAskQuestions } from './ask-questions.js';
+export { parseAskQuestions } from './ask-questions.js';
 
 export interface AskApiBody {
   sessionId: string;
@@ -41,40 +43,9 @@ export type AskApiBodyError =
   | 'bad_questions'
   | 'bad_question_shape'
   | 'bad_multiSelect'
+  | 'bad_defaultSelectedKeys'
   | 'bad_requestId'
   | 'bad_originKind';
-
-/** 校验单个 option 对象，返回解析后的 AskOption 或错误码。 */
-function parseOption(o: unknown): AskOption | AskApiBodyError {
-  if (!o || typeof o !== 'object') return 'bad_option_shape';
-  const oo = o as Record<string, unknown>;
-  if (typeof oo.key !== 'string' || !oo.key.trim()) return 'bad_option_key';
-  if (typeof oo.label !== 'string') return 'bad_option_label';
-  return { key: oo.key, label: oo.label };
-}
-
-/** 校验 questions[] 数组，返回解析后的 AskQuestion[] 或错误码。 */
-function parseQuestions(arr: unknown[]): AskQuestion[] | AskApiBodyError {
-  const result: AskQuestion[] = [];
-  for (const q of arr) {
-    if (!q || typeof q !== 'object' || Array.isArray(q)) return 'bad_question_shape';
-    const qq = q as Record<string, unknown>;
-    if (typeof qq.prompt !== 'string' || !qq.prompt.trim()) return 'bad_question_shape';
-    if (typeof qq.multiSelect !== 'boolean') return 'bad_multiSelect';
-    if (!Array.isArray(qq.options) || qq.options.length < 2) return 'bad_options';
-    const opts: AskOption[] = [];
-    const seen = new Set<string>();
-    for (const o of qq.options) {
-      const parsed = parseOption(o);
-      if (typeof parsed === 'string') return parsed;
-      if (seen.has(parsed.key)) return 'duplicate_option_key';
-      seen.add(parsed.key);
-      opts.push(parsed);
-    }
-    result.push({ prompt: qq.prompt, multiSelect: qq.multiSelect, options: opts });
-  }
-  return result;
-}
 
 /** Validate the request body. Returns either the parsed body or an error code
  *  ready to be sent back as `{ ok: false, error }` with HTTP 400.
@@ -122,7 +93,7 @@ export function parseAskBody(raw: unknown): AskApiBody | { error: AskApiBodyErro
   if (Array.isArray(r.questions)) {
     // 新格式：questions[] 多问多选
     if (r.questions.length === 0) return { error: 'bad_questions' };
-    const parsed = parseQuestions(r.questions);
+    const parsed = parseAskQuestions(r.questions);
     if (typeof parsed === 'string') return { error: parsed };
     questions = parsed;
   } else if (Array.isArray(r.options) && typeof r.prompt === 'string' && r.prompt.trim()) {
