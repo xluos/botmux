@@ -98,18 +98,6 @@ export function disarmTriggerFinalSuppression(ds: DaemonSession, turnId: string)
   if (ds.suppressedTriggerFinalTurns?.size === 0) ds.suppressedTriggerFinalTurns = undefined;
 }
 
-/** Project peers coordinate through explicit milestone sends. Their transcript
- * finals may contain machine receipts after a regular IM follow-up takes over
- * an HTTP-triggered turn. Keep that fallback quiet without touching the raw
- * transcript, trigger-result capture, explicit sends, or a later human turn. */
-export function armProjectPeerFinalSuppression(
-  ds: DaemonSession,
-  input: { foreignBot: boolean; projectMode: boolean; turnId?: string },
-): void {
-  if (ds.scope !== 'chat' || !input.foreignBot || !input.projectMode || !input.turnId) return;
-  armTriggerFinalSuppression(ds, input.turnId);
-}
-
 /** Carry internal-result isolation across a worker-confirmed live interruption.
  * Keep the source entry for trailing events; later independent turns receive
  * no inheritance event and retain their ordinary reply behavior. */

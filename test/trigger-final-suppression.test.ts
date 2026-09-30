@@ -3,7 +3,6 @@ import { ActiveTurnAuthority } from '../src/core/active-turn-authority.js';
 
 import {
   armTriggerFinalSuppression,
-  armProjectPeerFinalSuppression,
   disarmTriggerFinalSuppression,
   inheritTriggerReplyAnchor,
   inheritActiveTurnFinalSuppression,
@@ -131,27 +130,6 @@ describe('inheritTriggerReplyAnchor (P2: synthetic turn keeps the fold-back anch
     ds.session.replyTargets = { ...ds.session.replyTargets, trg_x: { rootMessageId: 'om_pinned', updatedAt: 'earlier' } };
     inheritTriggerReplyAnchor(ds, 'trg_x', 'now');
     expect(ds.session.replyTargets!['trg_x'].rootMessageId).toBe('om_pinned');
-  });
-});
-
-
-describe('project peer final fallback', () => {
-  it('suppresses only the exact peer turn in an existing project chat', () => {
-    const ds = { scope: 'chat' } as DaemonSession;
-    armProjectPeerFinalSuppression(ds, { foreignBot: true, projectMode: true, turnId: 'om_peer' });
-    expect(isTriggerFinalSuppressed(ds, 'om_peer')).toBe(true);
-    expect(isTriggerFinalSuppressed(ds, 'om_human')).toBe(false);
-    expect(isTriggerFinalSuppressed(ds, undefined)).toBe(false);
-  });
-  it.each([
-    { scope: 'chat', foreignBot: false, projectMode: true, turnId: 'om_human' },
-    { scope: 'chat', foreignBot: true, projectMode: false, turnId: 'om_peer' },
-    { scope: 'thread', foreignBot: true, projectMode: true, turnId: 'om_peer' },
-    { scope: 'chat', foreignBot: true, projectMode: true, turnId: undefined },
-  ])('leaves ordinary human, non-project, and thread replies unchanged: %j', input => {
-    const ds = { scope: input.scope } as DaemonSession;
-    armProjectPeerFinalSuppression(ds, input);
-    expect(ds.suppressedTriggerFinalTurns).toBeUndefined();
   });
 });
 

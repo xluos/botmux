@@ -1430,6 +1430,27 @@ async function collaborativeSession() {
 }
 
 describe('configured serial group input', () => {
+  it.each(['app', 'bot'])('keeps an independent project peer request visible (%s sender)', async senderType => {
+    vi.stubEnv('BOTMUX_XPI_ENABLED', 'false');
+    const { ds, other } = await collaborativeSession();
+    await modules.collaborationModeStore.writeGroupCollaborationMode(process.env.SESSION_DATA_DIR!, {
+      chatId: ds.chatId, mode: 'project', coordinatorAppId: ds.larkAppId, workerAppIds: ['app_peer'],
+    });
+    ds.activeInteractiveTurn = undefined;
+    ds.suppressedTriggerFinalTurns = new Map([['trg_finished_task', Date.now()]]);
+    const id = `om_independent_peer_${senderType}`;
+    await modules.daemon.__testOnly_handleThreadReply({
+      sender: { sender_id: { open_id: other.requestUserOpenId }, sender_type: senderType },
+      message: { message_id: id, chat_id: ds.chatId, chat_type: 'group', message_type: 'text',
+        content: JSON.stringify({ text: 'Which validation remains?' }), create_time: String(Date.now()) },
+    }, { chatId: ds.chatId, messageId: id, chatType: 'group', scope: 'chat',
+      anchor: ds.chatId, replyRootId: id, larkAppId: ds.larkAppId });
+    const inputs = vi.mocked(ds.worker!.send).mock.calls.map(c => c[0]).filter((m: any) => m.type === 'message');
+    expect(inputs).toEqual(expect.arrayContaining([expect.objectContaining({ turnId: id })]));
+    expect(ds.suppressedTriggerFinalTurns.has(id)).toBe(false);
+    expect(ds.suppressedTriggerFinalTurns.has('trg_finished_task')).toBe(true);
+  });
+
   it.each(['false', 'true'])('admits another member in order without an owner question with XPI=%s', async (xpiEnabled) => {
     vi.stubEnv('BOTMUX_XPI_ENABLED', xpiEnabled);
     const { ds, other } = await collaborativeSession();

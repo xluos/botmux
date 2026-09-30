@@ -1,4 +1,3 @@
-import { armProjectPeerFinalSuppression } from './core/trigger-final-suppression.js';
 import { execFileSync, type ChildProcess } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import { readFileSync, existsSync, mkdirSync, unlinkSync, watch, readdirSync, realpathSync } from 'node:fs';
@@ -23257,11 +23256,6 @@ async function handleThreadReplyAdmitted(
   logger.info(`Reply in ${scope}-scope session ${anchor.substring(0, 12)}: ${content.substring(0, 100)} (resources: ${resources.length})`);
 
   let ds = activeSessions.get(sessionKey(anchor, larkAppId));
-  if (ds) armProjectPeerFinalSuppression(ds, {
-    foreignBot: isForeignBot,
-    projectMode: readGroupCollaborationMode(config.session.dataDir, ctxChatId)?.mode === 'project',
-    turnId: parsed.messageId,
-  });
   // cmdContent (mention-stripped), matching the host-ask gate below: a raw
   // "@<bot> 另开任务" is not a choice, so the answer would fall through, the
   // record would time out, and the notice would ask for the answer just sent.
