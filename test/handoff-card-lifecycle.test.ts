@@ -7,6 +7,34 @@ const session = () => ({ session: { status: 'active', handoffLiveCard: { turnId:
 const io = () => ({ persist: vi.fn(), patch: vi.fn(), remove: vi.fn(async () => {}), clear: vi.fn() });
 
 describe('parallel handoff lifecycle', () => {
+  it.each(['stage', 'complete'] as const)('keeps a failed %s persistence retryable without card effects', async kind => {
+    const ds = session(), effects = io();
+    const previous = structuredClone(ds.session.handoffLiveCard);
+    const previousTitle = ds.currentTurnTitle;
+    const event = kind === 'stage'
+      ? { turnId: 'dev', sequence: 1, kind, title: 'Inventory reconciliation' }
+      : { turnId: 'dev', sequence: 1, kind, resultMessageId: 'om_result' };
+    effects.persist.mockImplementationOnce(() => { throw new Error('disk full'); });
+    await expect(applyHandoffCardEvent(ds, event, effects)).rejects.toThrow('disk full');
+    expect(ds.session.handoffLiveCard).toEqual(previous);
+    expect(ds.currentTurnTitle).toBe(previousTitle);
+    expect(effects.patch).not.toHaveBeenCalled();
+    expect(effects.remove).not.toHaveBeenCalled();
+    await applyHandoffCardEvent(ds, event, effects);
+    expect(ds.session.handoffLiveCard?.sequence).toBe(1);
+    expect(effects.persist.mock.calls.length).toBeGreaterThanOrEqual(2);
+    if (kind === 'stage') expect(effects.patch).toHaveBeenCalledOnce();
+    else expect(effects.remove).toHaveBeenCalledExactlyOnceWith('om_dev');
+  });
+  it('accepts caller-defined stages without requiring a development workflow', async () => {
+    const ds = session(), effects = io();
+    for (const [index, title] of ['翻译 · 校对', 'Inventory reconciliation', '自由阶段 🍃'].entries()) {
+      const event = parseHandoffCardEvent({ turnId: 'dev', sequence: index + 1, kind: 'stage', title });
+      await applyHandoffCardEvent(ds, event, effects);
+      expect(ds.currentTurnTitle).toBe(title);
+    }
+    expect(effects.remove).not.toHaveBeenCalled();
+  });
   it('keeps the developer card in place during parallel review and deployment, removes only after result', async () => {
     const dev = session(), review = session(), effects = io(); review.streamCardId = 'om_review';
     await applyHandoffCardEvent(dev, { turnId: 'dev', sequence: 1, kind: 'stage', title: '开发机器人 · 部署中' }, effects);
@@ -58,4 +86,65 @@ describe('parallel handoff lifecycle', () => {
     await applyHandoffCardEvent(ds, { turnId: 'dev', sequence: 1, kind: 'complete', resultMessageId: 'om_result' }, effects);
     expect(effects.remove).not.toHaveBeenCalled(); expect(ds.streamCardId).toBeUndefined();
   });
+  it('retries only the original card after a failed delete and a same-turn replacement', async () => {
+    const ds = session(), effects = io();
+    const event = { turnId: 'dev', sequence: 1, kind: 'complete', resultMessageId: 'om_result' } as const;
+    effects.remove.mockRejectedValueOnce(new Error('offline'));
+    await expect(applyHandoffCardEvent(ds, event, effects)).rejects.toThrow('offline');
+    ds.streamCardId = 'om_manual'; ds.streamCardNonce = 'manual';
+    ds.session.handoffLiveCard = JSON.parse(JSON.stringify(ds.session.handoffLiveCard));
+    await applyHandoffCardEvent(ds, event, effects);
+    expect(effects.remove).toHaveBeenLastCalledWith('om_dev');
+    expect(ds.streamCardId).toBe('om_manual');
+    expect(effects.clear).not.toHaveBeenCalled();
+    effects.remove.mockClear();
+    await applyHandoffCardEvent(ds, event, effects);
+    expect(effects.remove).not.toHaveBeenCalled();
+  });
+
+  it('does not clear a restored card with the same id but a new nonce on completion retry', async () => {
+    const ds = session(), effects = io();
+    const event = { turnId: 'dev', sequence: 1, kind: 'complete', resultMessageId: 'om_result' } as const;
+    await applyHandoffCardEvent(ds, event, effects);
+    const restored = session(), retry = io();
+    restored.session = JSON.parse(JSON.stringify(ds.session));
+    restored.streamCardNonce = 'restored-nonce';
+    restored.streamCardPending = true;
+    restored.streamCardPendingTurnId = 'dev';
+    restored.pendingCardId = 'om_dev';
+    restored.pendingCardJson = '{"content":"restored card"}';
+    expect(restored.session.handoffLiveCard?.closedCard).toEqual({
+      messageId: 'om_dev', nonce: 'n', removed: true,
+    });
+    await applyHandoffCardEvent(restored, event, retry);
+    expect(restored.streamCardId).toBe('om_dev');
+    expect(restored.streamCardNonce).toBe('restored-nonce');
+    expect(restored.streamCardPending).toBe(true);
+    expect(restored.streamCardPendingTurnId).toBe('dev');
+    expect(restored.pendingCardId).toBe('om_dev');
+    expect(restored.pendingCardJson).toBe('{"content":"restored card"}');
+    expect(retry.remove).not.toHaveBeenCalled();
+    expect(retry.clear).not.toHaveBeenCalled();
+  });
+
+  it('retries acknowledgement persistence without repeating a successful remote delete', async () => {
+    const ds = session(), effects = io();
+    const event = { turnId: 'dev', sequence: 1, kind: 'complete', resultMessageId: 'om_result' } as const;
+    let durable: typeof ds.session.handoffLiveCard;
+    effects.persist.mockImplementationOnce(() => { durable = structuredClone(ds.session.handoffLiveCard); })
+      .mockImplementationOnce(() => { ds.session.handoffLiveCard = durable; throw new Error('disk full'); });
+    await expect(applyHandoffCardEvent(ds, event, effects)).rejects.toThrow('disk full');
+    await applyHandoffCardEvent(ds, event, effects);
+    expect(effects.remove).toHaveBeenCalledExactlyOnceWith('om_dev');
+    expect(ds.streamCardId).toBeUndefined();
+  });
+
+  it('does not capture a replacement when restoring a closed state from an older version', async () => {
+    const ds = session(), effects = io();
+    ds.session.handoffLiveCard = { turnId: 'dev', sequence: 1, closed: true, resultMessageId: 'om_result' };
+    await applyHandoffCardEvent(ds, { turnId: 'dev', sequence: 1, kind: 'complete', resultMessageId: 'om_result' }, effects);
+    expect(effects.remove).not.toHaveBeenCalled();
+    expect(ds.streamCardId).toBe('om_dev');
+  });
+
 });

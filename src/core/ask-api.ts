@@ -5,9 +5,11 @@
  * spinning up an HTTP server, registering bots, or mounting a full session map.
  */
 
-import type { AskOption, AskQuestion } from './ask-types.js';
+import type { ServerResponse } from 'node:http';
+import { registerAsk } from './ask-broker.js';
 import { parseOption, parseAskQuestions } from './ask-questions.js';
 export { parseAskQuestions } from './ask-questions.js';
+import type { CreateAskInput, AskResult, AskOption, AskQuestion } from './ask-types.js';
 
 export interface AskApiBody {
   sessionId: string;
@@ -30,6 +32,7 @@ export interface AskApiBody {
 
 export type AskApiBodyError =
   | 'bad_body'
+  | 'unsupported_fields'
   | 'bad_sessionId'
   | 'bad_chatId'
   | 'bad_larkAppId'
@@ -121,7 +124,7 @@ export function parseAskBody(raw: unknown): AskApiBody | { error: AskApiBodyErro
     return { error: 'bad_options' };
   }
 
-  return {
+  const parsed: AskApiBody = {
     sessionId: r.sessionId,
     chatId: r.chatId,
     larkAppId: r.larkAppId,
@@ -132,4 +135,29 @@ export function parseAskBody(raw: unknown): AskApiBody | { error: AskApiBodyErro
     ...(originKind !== undefined ? { originKind } : {}),
     ...(r.acknowledge !== undefined ? { acknowledge: r.acknowledge as boolean } : {}),
   };
+  // Reject semantics this receiver did not parse instead of silently creating
+  // a different kind of Ask. Identity claims remain on the raw body for the
+  // route's authorization checks; options/prompt are normalized above.
+  const routeFields = new Set(['prompt', 'options', 'originCapability', 'originTurnId', 'originDispatchAttempt']);
+  if (Object.keys(r).some(key => r[key] !== undefined && !Object.hasOwn(parsed, key) && !routeFields.has(key))) {
+    return { error: 'unsupported_fields' };
+  }
+  return parsed;
+}
+
+/** The response, not IncomingMessage.close, tracks the long-poll lifetime:
+ * a fully read POST body may close while the client is still waiting. */
+export async function registerAskForResponse(
+  input: CreateAskInput,
+  res: ServerResponse,
+): Promise<AskResult> {
+  const controller = new AbortController();
+  const onClose = () => { controller.abort(); };
+  res.once('close', onClose);
+  if (res.destroyed) controller.abort();
+  try {
+    return await registerAsk(input, controller.signal);
+  } finally {
+    res.off('close', onClose);
+  }
 }

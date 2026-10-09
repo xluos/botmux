@@ -22,6 +22,12 @@ export function handoffCardClosed(ds: DaemonSession, turnId?: string): boolean {
   return !!state?.closed && state.turnId === (turnId ?? ds.currentTurnId ?? state.turnId);
 }
 
+export function handoffCardBlocksStreaming(ds: DaemonSession, turnId?: string): boolean {
+  if (!handoffCardClosed(ds, turnId)) return false;
+  const manual = ds.session.handoffLiveCard?.manualCard;
+  return !manual || manual.messageId !== ds.streamCardId || manual.nonce !== ds.streamCardNonce;
+}
+
 /** An authenticated connector reports business facts. Runtime owns card effects.
  * Persist before I/O so late screen updates and restart recovery cannot revive
  * a completed card. A delayed result can only delete its captured card id. */
@@ -41,20 +47,56 @@ export async function applyHandoffCardEvent(ds: DaemonSession, event: HandoffCar
   }
   if (event.kind === 'stage') {
     if (state.closed) throw new Error('live_stage_completed');
-    state.sequence = event.sequence;
-    state.title = event.title;
+    const previousTitle = ds.currentTurnTitle;
+    ds.session.handoffLiveCard = { ...state, sequence: event.sequence, title: event.title };
     ds.currentTurnTitle = event.title;
-    io.persist(); io.patch();
+    try { io.persist(); }
+    catch (error) {
+      ds.session.handoffLiveCard = state;
+      ds.currentTurnTitle = previousTitle;
+      throw error;
+    }
+    io.patch();
     return;
   }
-  state.sequence = event.sequence;
-  state.closed = true;
-  state.resultMessageId = event.resultMessageId;
-  io.persist();
-  const cardId = ds.streamCardId;
+  // Old persisted closed states without an identity fail safe: do not guess
+  // which present-day card a past completion owned.
+  const closedCard = state.closed ? state.closedCard
+    : { messageId: ds.streamCardId, nonce: ds.streamCardNonce };
+  ds.session.handoffLiveCard = {
+    ...state, sequence: event.sequence, closed: true, resultMessageId: event.resultMessageId, closedCard,
+  };
+  try { io.persist(); }
+  catch (error) {
+    ds.session.handoffLiveCard = state;
+    throw error;
+  }
+  const cardId = closedCard?.messageId;
   // Sentinel is runtime-private; a pending POST cleans itself on completion.
-  if (cardId && cardId !== '__posting__') await io.remove(cardId);
-  if (ds.session.handoffLiveCard !== state || ds.streamCardId !== cardId) return;
+  if (!closedCard?.removed && cardId && cardId !== '__posting__') await io.remove(cardId);
+  const afterRemove = ds.session.handoffLiveCard;
+  if (closedCard && !closedCard.removed && afterRemove?.turnId === event.turnId
+    && afterRemove.closed && afterRemove.closedCard?.messageId === cardId
+    && afterRemove.closedCard?.nonce === closedCard.nonce) {
+    // Keep the successful remote effect in memory if this save fails: a retry
+    // first persists it above, instead of asking Lark to delete it a second time.
+    const acknowledged = { ...afterRemove, closedCard: { ...closedCard, removed: true as const } };
+    ds.session.handoffLiveCard = acknowledged;
+    try { io.persist(); }
+    catch (error) {
+      // The store may restore the prior row after a failed write.
+      ds.session.handoffLiveCard = acknowledged;
+      throw error;
+    }
+  }
+  // SQLite persistence rehydrates nested session values, so reference identity
+  // cannot distinguish the persisted state from a successor. Fence the exact
+  // completed event instead, including a turn/card change during the delete.
+  const latest = ds.session.handoffLiveCard;
+  if (!latest || latest.turnId !== event.turnId || latest.sequence !== event.sequence
+    || !latest.closed || latest.resultMessageId !== event.resultMessageId
+    || (ds.currentTurnId && ds.currentTurnId !== event.turnId)
+    || !closedCard || ds.streamCardId !== cardId || ds.streamCardNonce !== closedCard.nonce) return;
   ds.streamCardId = undefined;
   ds.streamCardNonce = undefined;
   ds.streamCardPending = false;

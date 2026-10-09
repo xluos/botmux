@@ -62,6 +62,17 @@ prompt 是到点时会被执行的内容，就像用户新开一个话题向你�
 botmux schedule list
 \`\`\`
 
+### 修改提示词
+
+修改已有任务的 prompt 必须原地更新，不要先删除再创建：
+
+\`\`\`
+botmux schedule update <id> --prompt-file <UTF-8 文件路径>
+botmux schedule update <id> --prompt "新的完整提示词"
+\`\`\`
+
+两种输入方式只能选一种。更新成功保留任务 ID、执行时间、启停状态、每次新话题设置和运行记录；已开始的执行沿用原 prompt，后续执行使用新版，不会自动补跑。文件读取、身份验证或写入失败时保留旧任务，先排查错误，不要通过删除任务重试。旧版本没有 update 时先升级，不要把修改降级为先删后建。若提示任务绑定了守护前置条件（precondition），说明该任务只能在 Dashboard 修改，不要删除重建，告知用户去 Dashboard 的定时任务页编辑。
+
 ### 管理
 
 \`\`\`
@@ -70,6 +81,10 @@ botmux schedule resume <id>    # 恢复
 botmux schedule remove <id>    # 删除
 botmux schedule run <id>       # 标记立即执行（< 30 秒内 daemon 会触发）
 \`\`\`
+
+委托创建且宿主启用了 self-management 的任务，在自己的 scheduled turn 内可用
+\`botmux schedule pause self\` 或 \`botmux schedule remove self\` 停止自己。
+\`self\` 不能用于 update/resume/run，也不能指向或管理其他任务。
 
 ## 典型用法
 
@@ -457,7 +472,7 @@ botmux send --content-file $msg
 
 \`\`\`bash
 # 单图：默认追加到末尾
-botmux send --images /tmp/screenshot.png "截图如上，红框部分是问题所在。"
+botmux send --images "$TMPDIR/screenshot.png" "截图如上，红框部分是问题所在。"
 
 # 图文混排：占位符控制图片位置
 botmux send --images chart.png --images table.png <<'EOF'
@@ -480,7 +495,7 @@ EOF
 ### 带文件附件
 
 \`\`\`bash
-botmux send --files /tmp/report.pdf "报告已生成，请查收附件。"
+botmux send --files "$TMPDIR/report.pdf" "报告已生成，请查收附件。"
 \`\`\`
 
 ### 带视频预览
@@ -488,8 +503,32 @@ botmux send --files /tmp/report.pdf "报告已生成，请查收附件。"
 \`--videos <path>\` 发送本地 H.264 MP4 预览消息，可重复；\`--video-covers <path>\` 按顺序提供每个视频的封面图片（当前必须显式提供 cover）。视频会作为飞书/Lark media message 单独发送；正文存在时先发正文卡片，再发视频。
 
 \`\`\`bash
-botmux send --videos /tmp/replay.mp4 --video-covers /tmp/cover.png --no-mention "RRH replay preview"
+botmux send --videos "$TMPDIR/replay.mp4" --video-covers "$TMPDIR/cover.png" --no-mention "RRH replay preview"
 \`\`\`
+
+### 图表（vega-lite）
+
+正文里的 \`\`\`vega-lite 代码块会渲染成飞书原生图表（柱状 / 条形 / 折线 / 面积 / 散点 / 饼或环图），Web 等其它通道可以直接用同一段 Vega-Lite 渲染。只支持一个子集：
+
+- 数据只能用 \`data.values\` 内联（≤500 行，值为字符串 / 数字 / 布尔 / null）；\`data.url\`、\`transform\`、\`params\`、\`expr\`、\`signal\`、\`datasets\`、\`layer\` 等一律不支持。
+- \`mark\` 取 \`bar\` / \`line\` / \`area\` / \`point\` / \`arc\`；编码只用 \`x\` / \`y\` / \`color\` / \`theta\`（字段写 \`field\`、\`type\`、\`title\`，不支持 \`aggregate\` 等，先把数据聚合好再画）。
+- 饼图用 \`mark: arc\` + \`theta\`（数值）+ \`color\`（类别），不要写 \`x\`/\`y\`，\`theta\` 不带 \`title\`；\`mark: {type: arc, innerRadius: 40}\` 是环图。
+- \`x\`/\`y\` 的 \`title\` 是坐标轴标题，\`color\` 的 \`title\` 是图例标题；\`temporal\` 不解析日期，按给定顺序当类别画，先排好序。
+- 每张卡片最多 5 个图表；整张卡片的飞书请求体上限是 30KB，放不下时图表会逐级降级（图表 → 50 行表 → 10 行表 → 只留说明）。不支持或降级的图表在 stderr 给出原因；消息照常发出。发之前可以用 \`--dry-run\` 看 \`bytes\` / \`fits\`。
+
+~~~bash
+botmux send --no-mention <<'EOF'
+## 近 5 天上账
+\`\`\`vega-lite
+{"title":"近 5 天上账（万 THB）","data":{"values":[{"d":"09-28","v":18},{"d":"09-29","v":14}]},
+ "mark":"bar","encoding":{"x":{"field":"d","type":"ordinal"},"y":{"field":"v","type":"quantitative"}}}
+\`\`\`
+EOF
+~~~
+
+### 发送前自查：--dry-run
+
+\`botmux send --dry-run\`（正文照常用位置参数 / stdin / \`--content-file\`）不发送任何消息，只把正文按卡片渲染后输出 JSON：\`{dryRun, bytes, fits, diagnostics, card}\`，\`bytes\` 按飞书真实请求体计算。\`diagnostics\` 列出被降级的图表及原因。它只渲染正文，不上传图片/附件、不解析 @、不加页脚，也不需要会话。
 
 ### 原始飞书/Lark 卡片 JSON
 
@@ -498,7 +537,7 @@ botmux send --videos /tmp/replay.mp4 --video-covers /tmp/cover.png --no-mention 
 安全边界：自定义卡片是**纯展示 + open_url 跳转**——所有会触发回调的交互控件（回调按钮、下拉 select、person 选择、overflow、日期/时间选择、input、表单提交等）都会被拒绝，只保留展示元素（markdown/图片/多列/图表…）与 open_url 按钮。这样外部卡片无法误触 botmux 内部 close/restart/ask/relay/dashboard 等处理器。\`--card-file/--card-json\` 暂不和 \`--images\`/\`--files\`/\`--videos\`/\`--content-file\`/\`--voice\` 混用；素材需要先上传成飞书资源并写入卡片 JSON。
 
 \`\`\`bash
-botmux send --card-file /tmp/card.json --no-mention
+botmux send --card-file "$TMPDIR/card.json" --no-mention
 botmux send --card-json '{"schema":"2.0","body":{"direction":"vertical","elements":[{"tag":"markdown","content":"**Done**"}]}}' --mention-back
 \`\`\`
 
@@ -509,8 +548,8 @@ botmux send --card-json '{"schema":"2.0","body":{"direction":"vertical","element
 流程是 \`send\` 拿 \`messageId\` → \`card patch\` 按它更新：
 
 \`\`\`bash
-MID=$(botmux send --card-file /tmp/progress.json --no-mention | jq -r .messageId)
-botmux card patch --message-id "$MID" --card-file /tmp/progress-50.json
+MID=$(botmux send --card-file "$TMPDIR/progress.json" --no-mention | jq -r .messageId)
+botmux card patch --message-id "$MID" --card-file "$TMPDIR/progress-50.json"
 botmux card patch --message-id "$MID" --card-json '{"schema":"2.0","body":{"direction":"vertical","elements":[{"tag":"markdown","content":"进度: 100%"}]}}'
 \`\`\`
 
@@ -529,12 +568,12 @@ botmux card patch --message-id "$MID" --card-json '{"schema":"2.0","body":{"dire
 需要连续输出感时，不要高频整卡 \`patch\`。先发送 Card 2.0 卡片，并给需要流式写入的 \`markdown\` 或 \`plain_text\` 组件设置唯一 \`element_id\`（字母开头、最多 20 字符），然后用 CardKit 原生流：
 
 \`\`\`bash
-MID=$(botmux send --card-file /tmp/progress.json --no-mention | jq -r .messageId)
+MID=$(botmux send --card-file "$TMPDIR/progress.json" --no-mention | jq -r .messageId)
 OPEN=$(botmux card stream open --message-id "$MID" --summary "执行中")
 STREAM_ID=$(printf '%s' "$OPEN" | jq -r .streamId)
 
 # write 传该 element 的完整最新内容；新增后缀由飞书原生打字机动画呈现
-botmux card stream write --stream-id "$STREAM_ID" --element-id work_log --content-file /tmp/work-log.md
+botmux card stream write --stream-id "$STREAM_ID" --element-id work_log --content-file "$TMPDIR/work-log.md"
 botmux card stream finish --stream-id "$STREAM_ID" --summary "已完成"
 \`\`\`
 
@@ -1443,10 +1482,14 @@ description: 多 bot 长期项目编排。仅当任务同时需要「多个 bot 
 建完把任务清单链接用 \`botmux send\` 发给用户，让他确认能在飞书任务里看到。
 
 ### 5. 逐个派活（开话题）
-对每个子项目，把简报写进 /tmp/brief-X.md，再：
+对每个子项目，把简报写进会话专属临时目录（如 \`$TMPDIR/brief-X.md\`），再：
 \`\`\`bash
-botmux dispatch --title "<子项目标题>" --bot "<coder_open_id>:名字:coder" --bot "<reviewer_open_id>:名字:reviewer" --repo "<工作目录>" --brief-file /tmp/brief-X.md
+botmux dispatch --title "<子项目标题>" --bot "<coder_open_id>:名字:coder" --bot "<reviewer_open_id>:名字:reviewer" --repo "<工作目录>" --brief-file "$TMPDIR/brief-X.md"
 \`\`\`
+若任务明确要求目标 Bot 创建持久定时任务，改用稳定 \`--bot-app\` 派发并显式加
+\`--delegate schedule:create\`；该权限必须由当前真人回合和宿主策略共同批准，
+只允许目标 Bot 在本群创建一个任务，不能转委托。普通派发不要附带此参数。
+
 **简报必须写清子 bot 的「完成协议」**，否则收不齐：
 - 你的飞书任务 ID 是 <task_guid>；
 - 干完用 **lark-task** 把该任务标记完成、并把产出（链接/摘要）挂到任务评论或附件；
@@ -1467,7 +1510,7 @@ botmux dispatch --title "<子项目标题>" --bot "<coder_open_id>:名字:coder"
 所有子项目完成 → 读各任务产出 → 给用户一份总汇总（做了什么、产出在哪、遗留项）。
 
 ## 登记（别丢上下文）
-把「子项目 ↔ task_guid ↔ 话题root ↔ 指派bot」记一张小表（可写本地 scratch，如 /tmp/orchestrate-<项目>.json）；断点续跑/被唤起时据此恢复。
+把「子项目 ↔ task_guid ↔ 话题root ↔ 指派bot」记一张小表（可写本地 scratch，如 \`$TMPDIR/orchestrate-<项目>.json\`）；断点续跑/被唤起时据此恢复。
 
 ## 注意
 - **没通过用户审批不要建板/派活。**
@@ -1597,7 +1640,7 @@ botmux workflow architect <runId>
 
 > 编排好的流程是这样，对吗？确认就开跑。
 
-用户确认 → \`botmux workflow approve-dag <runId> --working-dir <任务工作目录>\`，然后 \`botmux workflow start <runId>\` 交 daemon 驱动开跑。\`--working-dir\` 会在 Gate-2 把 DAG 中所有机器人快照锁到同一个任务目录；研发任务应传入已确认的具体 Featspace 根目录。**别用 \`botmux v3 run\`**——那是 dev 终端路径，没有飞书审批卡。daemon 路径下，节点的 \`risk_gate\`（humanGate）执行期会在本话题**弹审批卡**，用户点「通过/拒绝」才继续；daemon 重启也能恢复待审批的卡。要改：需求要改 → \`botmux workflow revise-spec <runId>\`（退回 grilling，原 DAG 作废）重走 grill→spec→architect；需求没变、只是流程不满意 → \`botmux workflow revise-dag <runId>\`（退回 spec_approved）重跑 architect 重编。
+用户确认 → \`botmux workflow approve-dag <runId> [--working-dir <任务目录>]\`。可选 \`--working-dir\` 在首次 Gate-2 批准时冻结所有节点的工作目录；省略时使用各机器人的配置目录。研发任务应显式传入已确认的具体任务工作目录。已发布 run 重试复用原快照，后传目录不覆盖已有运行。然后 \`botmux workflow start <runId>\` 交 daemon 驱动开跑（**别用 \`botmux v3 run\`**——那是 dev 终端路径，没有飞书审批卡）。daemon 路径下，节点的 \`risk_gate\`（humanGate）执行期会在本话题**弹审批卡**，用户点「通过/拒绝」才继续；daemon 重启也能恢复待审批的卡。要改：需求要改 → \`botmux workflow revise-spec <runId>\`（退回 grilling，原 DAG 作废）重走 grill→spec→architect；需求没变、只是流程不满意 → \`botmux workflow revise-dag <runId>\`（退回 spec_approved）重跑 architect 重编。
 
 ## 关键纪律
 - 全程飞书一问一答，用 botmux send 对话。
