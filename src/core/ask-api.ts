@@ -25,6 +25,7 @@ export interface AskApiBody {
   /** Caller kind ('hook' | 'explicit' | …) namespacing the identity so an
    *  explicit `botmux ask` can't re-claim a hook ask's card. Optional. */
   originKind?: string;
+  acknowledge?: boolean;
 }
 
 export type AskApiBodyError =
@@ -45,7 +46,8 @@ export type AskApiBodyError =
   | 'bad_multiSelect'
   | 'bad_defaultSelectedKeys'
   | 'bad_requestId'
-  | 'bad_originKind';
+  | 'bad_originKind'
+  | 'bad_acknowledge';
 
 /** Validate the request body. Returns either the parsed body or an error code
  *  ready to be sent back as `{ ok: false, error }` with HTTP 400.
@@ -88,6 +90,8 @@ export function parseAskBody(raw: unknown): AskApiBody | { error: AskApiBodyErro
     originKind = r.originKind;
   }
 
+  if (r.acknowledge !== undefined && typeof r.acknowledge !== 'boolean') return { error: 'bad_acknowledge' };
+
   let questions: AskQuestion[];
 
   if (Array.isArray(r.questions)) {
@@ -126,5 +130,6 @@ export function parseAskBody(raw: unknown): AskApiBody | { error: AskApiBodyErro
     timeoutMs: r.timeoutMs,
     ...(requestId !== undefined ? { requestId } : {}),
     ...(originKind !== undefined ? { originKind } : {}),
+    ...(r.acknowledge !== undefined ? { acknowledge: r.acknowledge as boolean } : {}),
   };
 }
