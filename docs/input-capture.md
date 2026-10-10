@@ -1,15 +1,19 @@
 # 精确话题输入接管（通用插件候选）
 
-仅可信宿主可为一个现有活动会话注册接管。身份从 daemon 活动会话解析，精确绑定 bot/session/chat/anchor/owner；providerRef 是由插件解释的不透明引用。可通过 `--input-anchor <message-id>` 指定该 chat 内由宿主核验的原消息或插件卡片话题；sourceAnchor 仍固定为真实来源会话的 anchor。使用已启用、已安装并声明 card-actions 的插件，以复用其现有私有服务凭据。无需平台枚举、业务提示词或私有数据目录接口。
+仅可信宿主可为一个现有活动会话注册接管。身份从 daemon 活动会话解析，精确绑定 bot/session/chat/anchor/答题人；providerRef 是由插件解释的不透明引用。可通过 `--input-anchor <message-id>` 指定该 chat 内由宿主核验的原消息或插件卡片话题；sourceAnchor 仍固定为真实来源会话的 anchor。使用已启用、已安装并声明 card-actions 的插件，以复用其现有私有服务凭据。无需平台枚举、业务提示词或私有数据目录接口。
 
 ```
-botmux input-capture register --bot <app> --session <session> --plugin <installed-plugin> --request <stable-key> --ref <opaque-ref>
+botmux input-capture register --bot <app> --session <session> --plugin <installed-plugin> --request <stable-key> --ref <opaque-ref> [--actor <ou_openId>]
 botmux input-capture inspect --bot <app> --session <session> --binding <binding-id>
 botmux input-capture revoke --bot <app> --session <session> --binding <binding-id> --revision <revision>
 botmux input-capture revoke-set --bot <app> --session <session> --bindings '<conditions-json>'
 ```
 
-对应 `POST /api/sessions/:sessionId/input-capture`，body 包含 larkAppId、operation 与命令字段。注册支持可选布尔值 `captureAttachments`（CLI 为 `--capture-attachments true|false`），默认关闭；同一 request 的订阅能力固定，重试不得改变。路由必须通过当前宿主 HMAC；不加入 session relay allowlist。register 同一身份幂等；同一 bot/chat/anchor/owner 的第二个活动绑定冲突。撤销后保留墓碑，同一个 request 不会重新激活。
+对应 `POST /api/sessions/:sessionId/input-capture`，body 包含 larkAppId、operation 与命令字段。注册支持 `actorOpenId`（CLI 为 `--actor`）：省略时使用已有会话 owner；显式指定也必须等于该 owner。无个人 owner 的普通群必须显式指定合法答题人，且来源会话必须满足 `scope=chat`、`chatType=group`、`anchor=chatId`；无 owner 的 thread/p2p 或不一致的来源 anchor 均拒绝登记。上述来源限制不妨碍使用不同的、已核验的 `--input-anchor` 接收插件卡片回复。
+
+绑定回执中的 `ownerOpenId` 字段保存所选答题人，不会改写会话 owner；无 owner 群的交互上下文仍返回 `ownerOpenId:null`。登记和每条新输入均检查该答题人的原生 canTalk。相同群和 anchor 的不同 actor 可以用不同 request 建立并存绑定，消息按真实 sender 进入各自输入流；同一 bot/chat/anchor/actor 的第二个活动绑定冲突。同一 request 不能通过换 actor 改绑。
+
+注册还支持可选布尔值 `captureAttachments`（CLI 为 `--capture-attachments true|false`），默认关闭；同一 request 的订阅能力固定，重试不得改变。路由必须通过当前宿主 HMAC；不加入 session relay allowlist。register 同一身份幂等。撤销后保留墓碑，同一个 request 不会重新激活。
 
 `revoke-set` 的 `conditions-json` 是 1–32 个 `{bindingId, expectedRevision, expectedInputCount}` 对象。
 宿主在同一个日志事务内核验所有绑定都属于原 session、revision 匹配且已接收输入总数等于预期，然后一起撤销。

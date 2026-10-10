@@ -74,6 +74,15 @@ vi.mock('../src/bot-registry.js', () => ({
   isChatOncallBoundForAnyBot: (...args: any[]) => mockIsChatOncallBoundForAnyBot(...(args as [string])),
 }));
 
+// 默认与真实实现等价（测试 bot 未开 defaultOncall → 不绑定）；个别用例改写实现来模拟
+// 「首条消息懒绑定 oncall」，用于盯住绑定必须发生在 talk 判定之前。
+const mockEnsureDefaultOncallBound = vi.fn(async (_larkAppId: string, _chatId: string, _chatType: string) =>
+  undefined as { chatId: string; workingDir: string } | undefined);
+vi.mock('../src/services/oncall-store.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../src/services/oncall-store.js')>()),
+  ensureDefaultOncallBound: (...args: any[]) => mockEnsureDefaultOncallBound(...(args as [string, string, string])),
+}));
+
 const mockListChatBotMembers = vi.fn(async () => [] as Array<{ openId: string; name: string }>);
 const mockResolveCurrentChatBotOpenIds = vi.fn(async (_recv: string, _chat: string, _subjects: string[]) => ({
   ok: false, error: 'live_membership_unavailable', message: 'default_no_resolution',
@@ -2592,6 +2601,53 @@ describe('message listener polling backfill', () => {
     );
   });
 
+  it('routes a recent top-level merge-forward message found in chat history', async () => {
+    setupBotState({
+      allowedUsers: [USER_OPEN_ID],
+      messageListeners: {
+        chat_listener: {
+          enabled: true,
+          prompt: '阅读转发内容并响应',
+          senderPolicy: {
+            mode: 'include_only',
+            includeSenderOpenIds: [USER_OPEN_ID],
+            includeSenderTypes: ['user'],
+          },
+          messagePolicy: { includeMsgTypes: ['merge_forward'], scope: 'top_level' },
+          replyPolicy: { mode: 'thread', sessionMode: 'per_message' },
+        },
+      },
+    });
+    handlers = makeHandlers();
+    const forwarded = makeHistoryMessage({
+      senderAppId: USER_OPEN_ID,
+      senderType: 'user',
+      messageType: 'merge_forward',
+      messageId: 'msg-polled-forward',
+      chatId: 'chat_listener',
+      content: '{}',
+      createTime: String(Date.now()),
+    });
+    forwarded.sender.id_type = 'open_id';
+    mockListChatMessagesUntil.mockResolvedValueOnce([forwarded]);
+
+    await __pollMessageListenersOnceForTest(MY_APP_ID, handlers);
+    await flushEventWork();
+
+    expect(handlers.handleNewTopic).toHaveBeenCalledWith(
+      expect.objectContaining({ message: expect.objectContaining({ message_id: 'msg-polled-forward' }) }),
+      expect.objectContaining({
+        scope: 'thread',
+        anchor: 'msg-polled-forward',
+        messageListener: expect.objectContaining({
+          senderOpenId: USER_OPEN_ID,
+          senderType: 'user',
+          msgType: 'merge_forward',
+        }),
+      }),
+    );
+  });
+
   it('does not replay a polled listener message after the message_id is claimed', async () => {
     const card = makeHistoryMessage({
       senderAppId: OTHER_BOT_APP_ID,
@@ -3055,6 +3111,56 @@ describe('im.message.receive_v1 — bot-to-bot @mention routing', () => {
     expect(handlers.handleThreadReply).not.toHaveBeenCalled();
     expect(handlers.handleNewTopic).not.toHaveBeenCalled();
     expect(mockReplyMessage).toHaveBeenCalledWith(
+      MY_APP_ID,
+      'msg-001',
+      expect.stringContaining(OTHER_BOT_OPEN_ID),
+      'interactive',
+    );
+  });
+
+  it('auto-binds defaultOncall before the foreign-bot talk gate, so the first bot @ in a new oncall chat routes instead of sending a grant card', async () => {
+    // 回归：defaultOncall 的群绑定是「首条被观察到的消息」时懒写入的。原先只有人路径
+    // 在判权限前绑定，外部 bot 路径直接 evaluateBotTalk → 新拉的告警群里告警 bot
+    // 第一个开口时 oncallChats 还没有该 chat → 判无权限 → 误弹授权卡。
+    setupBotState({ allowedUsers: ['ou_owner'] });
+    mockGetOwnerOpenId.mockReturnValue('ou_owner');
+    mockGetChatMode.mockResolvedValueOnce('group');
+    mockReadFileSync.mockReturnValue('{}');  // empty cross-ref → unknown external bot
+    const entry = { chatId: 'chat-001', workingDir: '/repo' };
+    mockEnsureDefaultOncallBound.mockImplementationOnce(async () => {
+      // 对齐真实实现：ensureDefaultOncallBound 经 autoBindOncallFromDefault await
+      // 锁内 RMW + 磁盘写（多个异步 tick）之后才把 entry 发布进内存态
+      //（findOncallChat 读的那份）。这里让出两个 microtask 再翻转：
+      // 单 tick 时 mock 恢复反应在微任务队列里天然早于 async helper 的 resolve
+      // 反应，模拟不出 I/O 深度；双 tick 才能同时钉死两类漏 await——
+      // 调用点 fire-and-forget（evaluateBotTalk 在同同步段执行）与 helper 内不向
+      // 外传播 await（调用方在第二 tick 前恢复）都会读到未翻转的 oncall 态而变红。
+      await Promise.resolve();
+      await Promise.resolve();
+      mockFindOncallChat.mockReturnValue(entry);
+      return entry;
+    });
+    const event = makeBotMessageEvent({
+      senderOpenId: OTHER_BOT_OPEN_ID,
+      senderType: 'bot',
+      content: JSON.stringify({
+        zh_cn: { content: [[{ tag: 'at', user_id: MY_OPEN_ID }]] },
+      }),
+      rootId: undefined,
+    });
+    event.message.root_id = undefined as any;
+    handlers.isSessionOwner.mockReturnValue(false);
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    expect(mockEnsureDefaultOncallBound).toHaveBeenCalledWith(MY_APP_ID, 'chat-001', 'group');
+    expect(handlers.handleThreadReply).toHaveBeenCalledWith(event, expect.objectContaining({
+      scope: 'chat',
+      anchor: 'chat-001',
+      larkAppId: MY_APP_ID,
+    }));
+    expect(mockReplyMessage).not.toHaveBeenCalledWith(
       MY_APP_ID,
       'msg-001',
       expect.stringContaining(OTHER_BOT_OPEN_ID),
@@ -7641,6 +7747,11 @@ describe('im.message.receive_v1 — 主动开工 场景② (autoStartOnNewTopic,
     mockGetOwnerOpenId.mockReturnValue('ou_owner');
     mockGetChatMode.mockReset();
     mockGetChatMode.mockResolvedValue('topic');
+    // defaultOncall 懒绑定相关 mock 默认「未开/未绑」：mockReturnValue 持久生效，
+    // 不在这里复位会让某个用例翻转的 oncall 态泄漏进后续用例。
+    mockFindOncallChat.mockReturnValue(undefined);
+    mockEnsureDefaultOncallBound.mockReset();
+    mockEnsureDefaultOncallBound.mockResolvedValue(undefined);
     handlers = makeHandlers();
     handlers.isSessionOwner.mockReturnValue(false);
   });
@@ -7729,6 +7840,36 @@ describe('im.message.receive_v1 — 主动开工 场景② (autoStartOnNewTopic,
     // 发了授权申请卡（maybeSendGrantRequestCard → replyMessage interactive）
     expect(mockReplyMessage).toHaveBeenCalledTimes(1);
     expect(mockReplyMessage).toHaveBeenCalledWith(MY_APP_ID, 'msg-bot-seed-stranger', expect.any(String), 'interactive');
+  });
+
+  it('defaultOncall 懒绑定先于 autoTopic 授权门：陌生告警 bot 的免@新话题种子自动开工、不弹卡', async () => {
+    // 回归 #1765：免@新话题自动开工的 bot 种子点（autoTopic 分支）也曾漏掉
+    // defaultOncall 前置绑定。场景与上一用例完全相同（restricted + 无 cross-ref 的
+    // 陌生外部 bot，没有任何其它放行腿），唯一区别是本群开了 defaultOncall：
+    // 首条被观察到的消息触发懒绑定，绑定必须在 evaluateBotTalk 之前 await 完成，
+    // oncall 腿才放行 → 自动开工；否则与上一用例一样误弹授权卡、不建 session。
+    setupAutoTopicBotSender(true, false);
+    const entry = { chatId: 'chat-oncall-seed', workingDir: '/repo' };
+    mockEnsureDefaultOncallBound.mockImplementationOnce(async () => {
+      // 对齐真实实现：锁内 RMW + 磁盘写（多个异步 tick）后才发布内存态，
+      // 双 microtask 才能钉死调用链必须逐层 await（见 @ 路径同名用例注释）。
+      await Promise.resolve();
+      await Promise.resolve();
+      mockFindOncallChat.mockReturnValue(entry);
+      return entry;
+    });
+    const event = makeBotTopicSeed('msg-oncall-seed', 'chat-oncall-seed');
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    expect(mockEnsureDefaultOncallBound).toHaveBeenCalledWith(MY_APP_ID, 'chat-oncall-seed', 'group');
+    expect(handlers.handleNewTopic).toHaveBeenCalledWith(event, expect.objectContaining({
+      scope: 'thread',
+      anchor: 'msg-oncall-seed',
+      larkAppId: MY_APP_ID,
+    }));
+    expect(mockReplyMessage).not.toHaveBeenCalled();
   });
 
   it('restricted 模式陌生 bot 连发两条新话题 → 授权卡去重（节流），只发一次', async () => {
@@ -9980,6 +10121,30 @@ describe('solo-group mention bypass configuration', () => {
     const event = await send();
     expect(handlers.handleNewTopic).toHaveBeenCalledWith(event, expect.objectContaining({
       messageListener: expect.objectContaining({ senderOpenId: USER_OPEN_ID }),
+    }));
+  });
+
+  it('routes configured merge-forward topic roots through the listener', async () => {
+    start({
+      soloGroupMentionBypass: false,
+      messageListeners: {
+        [CHAT]: {
+          enabled: true, prompt: 'Read forwarded messages',
+          senderPolicy: { mode: 'include_only', includeSenderOpenIds: [USER_OPEN_ID], includeSenderTypes: ['user'] },
+          messagePolicy: { includeMsgTypes: ['merge_forward'], scope: 'top_level' },
+          replyPolicy: { mode: 'thread', sessionMode: 'per_message' },
+        },
+      },
+    });
+    const event = await send({
+      messageType: 'merge_forward',
+      content: '{}',
+    });
+    expect(handlers.handleNewTopic).toHaveBeenCalledWith(event, expect.objectContaining({
+      messageListener: expect.objectContaining({
+        senderOpenId: USER_OPEN_ID,
+        msgType: 'merge_forward',
+      }),
     }));
   });
 

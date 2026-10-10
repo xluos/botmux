@@ -46,7 +46,8 @@ import { canonicalJson } from './utils/canonical-input-hash.js';
 import { validateWorkingDir } from './core/working-dir.js';
 import { closeResidualClause, describeCloseResidual, parseCloseResidual, type ParsedCloseResidual } from './core/close-residual.js';
 import {
-  findAncestorSessionContext as findLiveAncestorSessionContext,
+  advanceAncestorSessionTurn,
+  findAncestorSessionMarkerContext as findLiveAncestorSessionContext,
   resolveSessionContext,
 } from './core/session-marker.js';
 import { resolveBotmuxDataDir } from './core/data-dir.js';
@@ -227,6 +228,7 @@ import {
   shouldApplySelfUpdate,
 } from './core/update-check.js';
 import { resolveCurrentVersion } from './utils/install-diagnostics.js';
+import { TURN_IDLE_PROTOCOL_VERSION } from './utils/turn-idle-report.js';
 import {
   resolveLocalDevCheckoutDir,
   isGitWorktree,
@@ -3468,7 +3470,7 @@ async function cmdUpgrade(args: string[] = []): Promise<void> {
   // Unsupported（实测真实 v3.18.4 二进制就是这条）。改为先按「二进制装在哪」
   // 判形态：npm 子包形态交回 npm/pnpm/bun，install.sh 形态自己换二进制。
   const strategy = currentUpdateStrategy(botmuxInstallRoot());
-  if (strategy.kind === 'self-replace') {
+  if (strategy.kind === 'self-replace' || strategy.kind === 'install-release') {
     try {
       const resolvedVersion = await fetchDistTagVersion(target.tag);
       if (!resolvedVersion) {
@@ -3477,8 +3479,14 @@ async function cmdUpgrade(args: string[] = []): Promise<void> {
       }
       const current = resolveCurrentVersion();
       const decision = shouldApplySelfUpdate(target, resolvedVersion, current);
-      if (!decision.proceed) {
-        if (decision.reason === 'already_latest') {
+      // install-release 允许同版本平迁到官方版；无参数 update 时当前自构版本若
+      // 不低于官方最新版则不隐式降级，切换旧版需显式指定目标版本。
+      const releaseMigration = strategy.kind === 'install-release'
+        && !isNewerVersion(current, resolvedVersion);
+      if (!decision.proceed && !releaseMigration) {
+        if (strategy.kind === 'install-release') {
+          console.log(`✅ 当前自部署版本 ${current} 不低于官方最新版 ${resolvedVersion}，未执行更新；如需切换到官方版请显式指定：botmux update ${resolvedVersion}`);
+        } else if (decision.reason === 'already_latest') {
           console.log(`✅ 已是最新版本（${current}）。`);
         } else {
           console.log(`✅ 当前已是版本 ${current}。`);
@@ -3496,7 +3504,13 @@ async function cmdUpgrade(args: string[] = []): Promise<void> {
         await withFileLock(lockTarget, async () => {
           acquired = true;
           const r = await replaceStandaloneBinary(resolvedVersion, strategy.target);
-          console.log(`✅ 升级完成：${r.asset} → ${r.target}（${current} → ${resolvedVersion}）。运行 botmux restart 以应用更新。`);
+          // install-release 的新二进制落在默认 launcher 路径，shell 里的 botmux
+          // 可能仍解析到旧自构二进制（PATH 顺序或 launcher 不在 PATH），这里必须
+          // 给出绝对路径，让 restart driver 确定是新版本，fleet 才会整体迁移。
+          const restartCommand = strategy.kind === 'install-release'
+            ? `"${r.target}" restart`
+            : 'botmux restart';
+          console.log(`✅ 升级完成：${r.asset} → ${r.target}（${current} → ${resolvedVersion}）。运行 ${restartCommand} 以应用更新。`);
         }, { maxWaitMs: 2_000 });
       } catch (error) {
         // ⚠️ 三态，不是二态。`withFileLock` 拿不到锁时是**抛异常**不是安静返回，
@@ -3899,6 +3913,7 @@ interface SessionData {
    *  进来，据此拦住「顶层 @ 之后那条消息才被开成话题」时 quote 把回复带进话题。 */
   turnReplyContexts?: Record<string, {
     target?: { mode?: string; chatId?: string; rootMessageId?: string };
+    quoteTargetId?: string;
     inThread?: boolean;
     replyTargetSenderOpenId?: string;
     replyTargetSenderIsBot?: boolean;
@@ -6738,7 +6753,7 @@ const SEND_HELP_BODY = [
   '                                       显式允许该已启用插件声明的 callback action',
   '       --layout result|progress|risk|blocked|handoff',
   '                                       可选回复卡卡头薄壳；只在关键结果/进度/风险/阻塞/交接节点显式使用',
-  '       --response-kind progress|final|auxiliary  可选；未声明按 progress/非 final，只有 final 挂反馈',
+  '       --response-kind progress|final|auxiliary  可选；未声明按 progress/非 final，只有 final 挂反馈与页脚签名',
   '       --expected-link <url>           要求最终渲染正文原样包含该 URL（可重复）；缺失时在任何外部副作用前拒发',
   '       --as independent|suggestion     对方任务正在跑时声明处理方式：另开任务 / 留给当前任务',
   '       --mention <id:name>             @提及（可重复）。id 默认是 open_id；bot 配置开启',
@@ -9448,8 +9463,8 @@ async function cmdSend(rest: string[]): Promise<void> {
         : isolatedManagedOriginCtx?.turnId
           ? isolatedManagedOriginCtx
           : undefined);
-  const originTurnId = authoritativeOriginTurnCtx?.turnId;
-  const originDispatchAttempt = authoritativeOriginTurnCtx?.dispatchAttempt;
+  let originTurnId = authoritativeOriginTurnCtx?.turnId;
+  let originDispatchAttempt = authoritativeOriginTurnCtx?.dispatchAttempt;
   const originSession = originSessionId
     ? sessionsForOrigin.get(originSessionId)
     : undefined;
@@ -9808,7 +9823,7 @@ async function cmdSend(rest: string[]): Promise<void> {
     process.exit(1);
   }
 
-  const currentTurnId = originTurnId;
+  let currentTurnId = originTurnId;
   let s: SessionData | undefined;
 
   // Riff (remote backend) sandbox: no local daemon/sessions.json/bots.json.
@@ -9870,9 +9885,35 @@ async function cmdSend(rest: string[]): Promise<void> {
   let deferredMaterializedByThisCommand = false;
   let deferredTopicRootMessageIdForOutput: string | undefined;
 
+  const turnSendLedger = new TurnSendLedger(resolveDataDir());
+  while (liveMarkerCtx?.markerPid && liveMarkerCtx.turnId && (liveMarkerCtx.queuedTurnId || (liveMarkerCtx.queuedTurns && liveMarkerCtx.queuedTurns.length > 0))) {
+    const activeMarkerKey = {
+      larkAppId: originSession?.larkAppId ?? s.larkAppId,
+      sessionId: originSessionId ?? sid,
+      turnId: liveMarkerCtx.turnId,
+      ...(liveMarkerCtx.dispatchAttempt !== undefined ? { dispatchAttempt: liveMarkerCtx.dispatchAttempt } : {}),
+    };
+    const activePrior = turnSendLedger.read(activeMarkerKey);
+    if (activePrior?.final) {
+      const advResult = advanceAncestorSessionTurn(sendDataDir, liveMarkerCtx.markerPid, liveMarkerCtx.turnId);
+      if (advResult.advanced && advResult.turnId) {
+        liveMarkerCtx = findLiveAncestorSessionContext(sendDataDir);
+        originTurnId = advResult.turnId;
+        currentTurnId = advResult.turnId;
+        originDispatchAttempt = liveMarkerCtx?.dispatchAttempt;
+        continue;
+      }
+    }
+    break;
+  }
+
   // Prefer the exact per-turn reply anchor; the latest single slot is only a
   // compatibility fallback for sessions persisted before replyTargets.
   const turnReplyTarget = pickTurnReplyTarget(s, currentTurnId);
+  const turnBoundQuoteTarget = turnReplyTarget?.rootMessageId
+    ?? s.turnReplyContexts?.[currentTurnId ?? '']?.quoteTargetId
+    ?? (turnReplyTarget?.turnId?.startsWith('om_') ? turnReplyTarget.turnId : undefined)
+    ?? (currentTurnId?.startsWith('om_') ? currentTurnId : undefined);
   if (privateReplyEnabled(s) && (sendInto || overrideChatId)) {
     console.error('当前群角色已启用私聊回复，请移除 --into / --chat-id 后发送给本轮提问人。');
     process.exit(2);
@@ -10378,7 +10419,8 @@ async function cmdSend(rest: string[]): Promise<void> {
           noQuote,
           quoteTargetId: explicitQuote
             ?? frozenTurnDispatch?.quoteTargetId
-            ?? s.quoteTargetId,
+            ?? turnBoundQuoteTarget
+            ?? (currentTurnId ? undefined : s.quoteTargetId),
           frozenReplyTarget: frozenTurnReplyTarget,
           turnReplyTarget: turnReplyTarget
             ? {
@@ -10395,6 +10437,7 @@ async function cmdSend(rest: string[]): Promise<void> {
       replyTargetSenderOpenId: explicitVcMeetingImOrigin?.replyTargetSenderOpenId
         ?? frozenTurnDispatch?.replyTargetSenderOpenId
         ?? turnReplyTarget?.senderOpenId
+        ?? s.turnReplyContexts?.[currentTurnId ?? '']?.replyTargetSenderOpenId
         ?? (currentTurnId ? undefined : s.quoteTargetSenderOpenId),
     },
     presentation: {
@@ -10421,7 +10464,6 @@ async function cmdSend(rest: string[]): Promise<void> {
       })),
     },
   });
-  const turnSendLedger = new TurnSendLedger(dataDir);
   try {
     await turnSendLedger.pruneCompletedIfDue();
   } catch (error) {
@@ -10434,6 +10476,12 @@ async function cmdSend(rest: string[]): Promise<void> {
     const code = (error as NodeJS.ErrnoException | undefined)?.code;
     if (code !== 'EPERM' && code !== 'EACCES' && code !== 'EROFS') {
       logger.warn(`[turn-send-ledger] completed-record prune skipped: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+  if (responseKind === 'auxiliary' && turnSendKey && liveMarkerCtx?.steerPromotedTurn) {
+    const prior = turnSendLedger.read(turnSendKey);
+    if (!prior?.final) {
+      effectiveResponseKind = 'final';
     }
   }
   const executeTurnPrimary = async (
@@ -10681,6 +10729,13 @@ async function cmdSend(rest: string[]): Promise<void> {
           appendFileSync(join(markerDir, `${sid}.jsonl`), JSON.stringify(marker) + '\n');
         } catch { /* best-effort：漏记只多一条兜底，不致命 */ }
       }
+      if (effectiveResponseKind === 'final' && liveMarkerCtx?.markerPid) {
+        advanceAncestorSessionTurn(
+          sendDataDir,
+          liveMarkerCtx.markerPid,
+          originTurnId ?? currentTurnId,
+        );
+      }
       console.error(voiceDelivery.replayed
         ? `✓ 已复用本轮已发送语音 ${messageId}`
         : `✓ 已发送语音 ${messageId} ｜ ${Math.round((voiceDurationMs ?? 0) / 1000)}s`);
@@ -10795,6 +10850,13 @@ async function cmdSend(rest: string[]): Promise<void> {
         if (previewText) marker.previewText = previewText;
         appendFileSync(join(markerDir, `${originSessionId}.jsonl`), JSON.stringify(marker) + '\n');
       } catch { /* best-effort：漏记只多一条兜底 */ }
+      if (effectiveResponseKind === 'final' && liveMarkerCtx?.markerPid) {
+        advanceAncestorSessionTurn(
+          sendDataDir,
+          liveMarkerCtx.markerPid,
+          originTurnId ?? currentTurnId,
+        );
+      }
       // Do not write this startup snapshot back after the async provider calls:
       // the daemon may have advanced the dispatch ledger or accepted another
       // turn in the meantime.  Daemon settlement owns exact target retirement.
@@ -10830,6 +10892,7 @@ async function cmdSend(rest: string[]): Promise<void> {
   const replyTargetSenderOpenId = explicitVcMeetingImOrigin?.replyTargetSenderOpenId
     ?? frozenTurnDispatch?.replyTargetSenderOpenId
     ?? turnReplyTarget?.senderOpenId
+    ?? s.turnReplyContexts?.[currentTurnId ?? '']?.replyTargetSenderOpenId
     // #750 exact-turn contract: the global latest-slot quote sender may ONLY be
     // borrowed as a legacy fallback when there is NO currentTurnId (true
     // legacy/no-turn send). With a turnId, an exact-turn map miss/eviction must
@@ -11267,7 +11330,8 @@ async function cmdSend(rest: string[]): Promise<void> {
       ? undefined
       : explicitVcMeetingImOrigin?.larkMessageId
         ?? frozenTurnDispatch?.quoteTargetId
-        ?? s.quoteTargetId,
+        ?? turnBoundQuoteTarget
+        ?? (currentTurnId ? undefined : s.quoteTargetId),
   });
   // 「顶层 @ 之后那条消息才被开成话题」的发送侧半边。飞书的 reply 接口让回复继承
   // 被引用消息**此刻**的话题归属（`reply_in_thread:false` 只是不新开话题，逃不出
@@ -11819,8 +11883,9 @@ async function cmdSend(rest: string[]): Promise<void> {
       // the session owner). Bot recipients are filtered out so footer chrome
       // cannot accidentally wake a sibling bot.
       // Brand segment honours this bot's configured brandLabel (unset →
-      // default botmux, '' → suppressed, else custom). Same resolver/rule as
-      // the daemon's card builders so both send paths render identically.
+      // default botmux, '' → suppressed, else custom). Only attached to final
+      // replies (or top-level broadcasts); interim sends (progress / auxiliary)
+      // omit brand to avoid noisy repeated signatures across turns.
       // All real mentions land on one footer line: human addressee first, then
       // explicit @ targets (incl. handoff bots), then cc. Ids already inlined in
       // the body prose are skipped. Top-level publish keeps sendTo empty.
@@ -11831,8 +11896,12 @@ async function cmdSend(rest: string[]): Promise<void> {
         inlinedIds: usedIds,
       });
       const usageSnapshot = await readCardUsageSnapshotForSend(s, appId);
+      const shouldRenderBrand = effectiveResponseKind === 'final' || sendTopLevel;
+      const footerBrand = shouldRenderBrand
+        ? renderBrandTemplate(resolveBrandLabel(appId), s.workingDir)
+        : '';
       const footer = buildReplyCardFooter({
-        brand: renderBrandTemplate(resolveBrandLabel(appId), s.workingDir),
+        brand: footerBrand,
         recipientOpenIds: footerRecipients,
         usage: usageSnapshot,
         locale: localeForBot(appId),
@@ -12093,6 +12162,17 @@ async function cmdSend(rest: string[]): Promise<void> {
           : 'non_patchable',
       );
     }
+    let advancedNextTurnId: string | undefined;
+    if (effectiveResponseKind === 'final' && liveMarkerCtx?.markerPid) {
+      const advResult = advanceAncestorSessionTurn(
+        sendDataDir,
+        liveMarkerCtx.markerPid,
+        originTurnId ?? currentTurnId,
+      );
+      if (advResult.advanced) {
+        advancedNextTurnId = advResult.turnId;
+      }
+    }
 
     // Send attachments as separate messages — best-effort. The primary message
     // is already delivered above; a failing attachment must not throw out to the
@@ -12163,7 +12243,9 @@ async function cmdSend(rest: string[]): Promise<void> {
     const sendLocale = localeForBot(appId);
     console.error(unifiedReplyUsed && effectiveResponseKind !== 'final'
       ? t('ai.send.after_success_unified', undefined, sendLocale)
-      : t('ai.send.after_success_hint', undefined, sendLocale));
+      : advancedNextTurnId
+        ? t('ai.send.after_success_steer_advanced', undefined, sendLocale)
+        : t('ai.send.after_success_hint', undefined, sendLocale));
     if (asChoice) {
       console.error(t(
         asChoice === 'independent' ? 'xpi.send.as_marked_independent' : 'xpi.send.as_marked_suggestion',
@@ -14838,58 +14920,144 @@ async function cmdSessionReady(): Promise<void> {
     if (p && typeof p.source === 'string') source = p.source;
   } catch { /* 非 JSON / 空 → 不带 source */ }
 
+  await postSessionScopedSignal('/api/session-ready', { source });
+  process.exit(0);
+}
+
+// ─── 会话作用域信号投递（session-ready / turn-idle 共用） ──────────────────────
+//
+// 两条信号同构：会话归属只靠子进程继承的 env（worker spawn 时设的
+// BOTMUX_SESSION_ID / BOTMUX_LARK_APP_ID）。鉴权双路径：能读 host secret（非沙箱）
+// 走 HMAC；读不到（沙箱 / read-isolation）带本会话 rotating per-turn capability。
+//
+// Host sessions discover the owning daemon through its descriptor. Linux bwrap /
+// read-isolated sessions deliberately cannot read that directory, so use the
+// worker-injected loopback port as a fallback. The port is not a credential: the
+// route still verifies the rotating per-turn capability carried below.
+//
+// fail-open 铁律：env 缺失（adopt / 非 botmux 会话）、daemon 不可达、未授权一律
+// 静默返回 —— 绝不挂死 CLI 的启动或回合结算（worker 侧各有兜底）。
+//
+// payload 是路由专属字段；sessionId 与 origin* 凭据/身份由本函数统一填。origin*
+// 同 session-ready：turnId 取 worker 发布的 active-turn marker（不可读时回落 env），
+// 它是**上报者声明的**回合身份，不是凭据 —— capability 才是凭据。
+async function postSessionScopedSignal(
+  route: string,
+  payload: Record<string, unknown>,
+  opts?: {
+    /** Frozen-at-the-event origin (turn-idle v2): transport it verbatim instead
+     *  of resolving the live marker here — the marker may already name the NEXT
+     *  dispatch by the time this child runs (see utils/turn-idle-report.ts). */
+    frozenOrigin?: { turnId: string; dispatchAttempt?: number; capability?: string };
+  },
+): Promise<void> {
   const sessionId = process.env.BOTMUX_SESSION_ID;
   const larkAppId = process.env.BOTMUX_LARK_APP_ID;
-  // env 缺失 → adopt / 非 botmux 会话；就绪门控对它们不适用，静默放行。
-  if (!sessionId || !larkAppId) process.exit(0);
-
-  // Host sessions discover the owning daemon through its descriptor. Linux
-  // bwrap / read-isolated sessions deliberately cannot read that directory,
-  // so use the worker-injected loopback port as a fallback. The port is not a
-  // credential: /api/session-ready still verifies the rotating per-turn
-  // capability carried below.
-  let discoveredPort: number | undefined;
-  try { discoveredPort = findDaemon(larkAppId)?.ipcPort; } catch { /* masked/unreadable registry */ }
-  const ipcPort = resolveDaemonIpcPort(
-    discoveredPort,
-    process.env.BOTMUX_DAEMON_IPC_PORT,
-  );
-  if (ipcPort) {
-    try {
-      const relayDir = process.env.BOTMUX_SEND_RELAY;
-      const originCapability = readManagedOriginCapability(
+  if (!sessionId || !larkAppId) return;
+  try {
+    let discoveredPort: number | undefined;
+    try { discoveredPort = findDaemon(larkAppId)?.ipcPort; } catch { /* masked/unreadable registry */ }
+    const ipcPort = resolveDaemonIpcPort(
+      discoveredPort,
+      process.env.BOTMUX_DAEMON_IPC_PORT,
+    );
+    if (!ipcPort) return;
+    const relayDir = process.env.BOTMUX_SEND_RELAY;
+    const frozenOrigin = opts?.frozenOrigin;
+    const originCapability = frozenOrigin?.capability
+      ?? readManagedOriginCapability(
         resolveDataDir(),
         sessionId,
         relayDir,
         process.env.BOTMUX_ORIGIN_CHANNEL_ID,
       )?.capability;
-      const liveOrigin = resolveSessionContext(resolveDataDir(), sessionId);
-      const envAttempt = Number(process.env.BOTMUX_DISPATCH_ATTEMPT);
-      const originTurnId = liveOrigin?.turnId ?? process.env.BOTMUX_TURN_ID;
-      const originDispatchAttempt = liveOrigin?.dispatchAttempt
-        ?? (Number.isSafeInteger(envAttempt) && envAttempt > 0 ? envAttempt : undefined);
-      const init = {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({
-          sessionId,
-          source,
-          originCapability,
-          originTurnId,
-          originDispatchAttempt,
-        }),
-      } satisfies RequestInit;
-      let hostSecret: string | undefined;
-      if (!relayDir) {
-        try { hostSecret = loadDaemonIpcSecret(); } catch { /* Seatbelt/read-isolated CLI */ }
-      }
-      if (!hostSecret) {
-        await loopbackFetch(`http://127.0.0.1:${ipcPort}/api/session-ready`, init);
-      } else {
-        await fetchDaemonIpc(ipcPort, '/api/session-ready', init, hostSecret);
-      }
-    } catch { /* daemon 不可达 → 放弃，worker 走超时兜底 */ }
+    // Frozen origins never consult the live marker nor its env fallback: the
+    // report must name the turn that was in flight AT THE EVENT, not whatever
+    // this child can read after the fact.
+    const liveOrigin = frozenOrigin ? undefined : resolveSessionContext(resolveDataDir(), sessionId);
+    const envAttempt = Number(process.env.BOTMUX_DISPATCH_ATTEMPT);
+    const init = {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        sessionId,
+        originCapability,
+        originTurnId: frozenOrigin
+          ? frozenOrigin.turnId
+          : (liveOrigin?.turnId ?? process.env.BOTMUX_TURN_ID),
+        originDispatchAttempt: frozenOrigin
+          ? frozenOrigin.dispatchAttempt
+          : (liveOrigin?.dispatchAttempt
+            ?? (Number.isSafeInteger(envAttempt) && envAttempt > 0 ? envAttempt : undefined)),
+        ...payload,
+      }),
+    } satisfies RequestInit;
+    let hostSecret: string | undefined;
+    if (!relayDir) {
+      try { hostSecret = loadDaemonIpcSecret(); } catch { /* Seatbelt/read-isolated CLI */ }
+    }
+    if (!hostSecret) {
+      await loopbackFetch(`http://127.0.0.1:${ipcPort}${route}`, init);
+    } else {
+      await fetchDaemonIpc(ipcPort, route, init, hostSecret);
+    }
+  } catch { /* daemon 不可达 → 放弃，worker 走超时兜底 */ }
+}
+
+// ─── botmux __turn-idle-v2 ──────────────────────────────────────────────────────
+//
+// CLI 进程内的**结构化回合空闲**上报客户端。当前唯一调用方是 dsh-tui 的 cordis
+// wrapper 插件：`agent/status` 落到 idle（一个回合真正结束）时执行
+// BOTMUX_TURN_IDLE_COMMAND，即本子命令。
+//
+// 协议 v2（见 utils/turn-idle-report.ts 的 TURN_IDLE_PROTOCOL_VERSION）：插件在
+// `agent/status` 回调里**当场冻结** (turnId, dispatchAttempt[, per-dispatch
+// capability]) 随 payload 送来，本命令只做搬运 —— **绝不**在此重新解析 worker
+// 发布的 active-turn marker：本命令跑在插件 fire-and-forget 的 detached 子进程里，
+// 从事件到 exec 之间 worker 完全可能已经写下 B 轮（dsh-tui 支持 busy 期 steer，
+// 且 worker 在真实写入前就改写 turn/attempt/marker/capability），于是 A 轮的报告
+// 会自称 B、反过来骗过 worker 的精确匹配 fence → B 仍在跑就 fireIdle()。
+// 缺协议版本 / 缺冻结身份（v1 插件只送 seq+pid / 读不到冻结来源）一律静默丢弃：
+// 宁可少一条 idle 边（该轮退回既有兜底），也绝不早判一轮为 idle。
+//
+// 子命令名带协议版本（`__turn-idle-v2`，见 adapters/hook-command.ts）：命令指向的
+// cli.js 会被 in-place update / rollback 换成任意版本，而长命 TUI 进程里仍是生成时
+// 那份 v2 插件。不带版本的旧子命令会让 v1 CLI「成功」处理 v2 payload，却完全不看
+// 冻结身份、改读执行时的 marker —— 版本化子命令让混装直接变成「v1 不认识 → 一个
+// 请求都不发」，fail closed。
+//
+// 与 session-ready 同一条 fail-open 铁律：env 缺失 / daemon 不可达 / 未授权都静默
+// exit 0，绝不产生用户可见输出，也绝不阻塞回合结算。capability 仍是唯一凭据
+// （冻结版本随 payload 走，缺省时按现行方式现场读本会话 rotating capability），
+// daemon 侧再把声明回合与该 capability 的 live origin 绑定校验。
+async function cmdTurnIdle(): Promise<void> {
+  const payloadText = (await readStdinWithTimeout(2000)).toString('utf-8');
+  let seq: number | undefined;
+  let pid: number | undefined;
+  let frozenOrigin: { turnId: string; dispatchAttempt?: number; capability?: string } | undefined;
+  try {
+    const parsed = JSON.parse(payloadText);
+    if (parsed && Number.isSafeInteger(parsed.seq) && parsed.seq > 0) seq = parsed.seq;
+    if (parsed && Number.isSafeInteger(parsed.pid) && parsed.pid > 0) pid = parsed.pid;
+    if (parsed && parsed.v === TURN_IDLE_PROTOCOL_VERSION) {
+      const turnId = typeof parsed.turnId === 'string' && parsed.turnId.length > 0
+        && parsed.turnId.length <= 256
+        ? parsed.turnId
+        : undefined;
+      const attempt = Number.isSafeInteger(parsed.dispatchAttempt) && parsed.dispatchAttempt > 0
+        ? parsed.dispatchAttempt as number
+        : undefined;
+      const capability = typeof parsed.capability === 'string' && /^[a-f0-9]{32,128}$/i.test(parsed.capability)
+        ? parsed.capability
+        : undefined;
+      if (turnId) frozenOrigin = { turnId, ...(attempt !== undefined ? { dispatchAttempt: attempt } : {}), ...(capability ? { capability } : {}) };
+    }
+  } catch { /* 无 payload / 非 JSON → 没有冻结身份，静默丢弃 */ }
+  if (!frozenOrigin) {
+    process.exit(0);
+    return;
   }
+  await postSessionScopedSignal('/api/turn-idle', { seq, pid }, { frozenOrigin });
   process.exit(0);
 }
 
@@ -16145,6 +16313,15 @@ if (process.env.BOTMUX_WORKFLOW === '1') {
     // workflow, deployment, or external messaging effect.
     'preview',
     'session-ready',
+    // Structured end-of-turn idle report (dsh-tui wrapper plugin). Same class as
+    // `session-ready`: a purely local, session-scoped callback with no chat,
+    // workflow, deployment, or external messaging effect — the worker fence
+    // decides whether it may settle a turn. The versioned `__`-prefixed name is
+    // the fail-closed skew switch (see turnIdleHookCommand): a v1 CLI must not be
+    // able to "service" a v2 report by re-reading the live marker, and the `__`
+    // prefix keeps the name outside the plugin-command grammar so the v1 default
+    // branch's plugin lookup can never match it.
+    '__turn-idle-v2',
     // UserPromptSubmit hook client botmux installs into ~/.claude/settings.json.
     // Like `session-ready` (SessionStart) and `hook`, it's a purely local hook
     // callback with no chat/workflow/deploy effect, and it fires on EVERY prompt
@@ -17346,6 +17523,14 @@ switch (command) {
     // `botmux session-ready` — Claude 家族 SessionStart hook 客户端，通知 daemon
     // 已越过外层 selector；worker 再等待 hook 后的新 prompt 证据。
     await cmdSessionReady();
+    break;
+  }
+  case '__turn-idle-v2': {
+    // `botmux __turn-idle-v2` — CLI 进程内结构化回合空闲上报客户端（dsh-tui 的
+    // cordis wrapper 插件在 agent/status 落到 idle 时执行）；worker 侧做回合 fence。
+    // 子命令名带协议版本：v1 CLI 不认识它，混装时一个请求都不会发（见
+    // adapters/hook-command.ts 的 turnIdleHookCommand）。
+    await cmdTurnIdle();
     break;
   }
   case 'user-prompt-hook': {

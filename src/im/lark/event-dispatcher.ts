@@ -27,9 +27,9 @@ import { isTeamBot, recordTeamBot } from '../../services/team-bots-store.js';
 import { isTeamGroupChat } from '../../services/team-groups-store.js';
 import { isPlatformTeamBot, isPlatformHallChat, isPlatformTeamMember } from '../../services/platform-team-store.js';
 import { getBotUnionId, recordBotUnionId, recordBotUnionIdFromMentions } from '../../services/bot-union-ids-store.js';
-import { docWatchAnchor, getDocSubscription, putDocSubscription, removeDocSubscription, listAllDocSubscriptions, settleDocCommentWsDelivery, type DocSubscription } from '../../services/doc-subs-store.js';
+import { docWatchAnchor, getDocSubscription, putDocSubscription, removeDocSubscription, listAllDocSubscriptions, recordDocWatchActivity, setDocTitle, settleDocCommentWsDelivery, type DocSubscription, type DocWatchOutcome } from '../../services/doc-subs-store.js';
 import { wasPendingReviewNotified, markPendingReviewNotified } from '../../services/under-review-notify-store.js';
-import { getDocComment, isBotAuthoredReply, hasBotSentinel, commentTriggerAllowed, BOT_REPLY_SENTINEL, addCommentReactionChecked } from './doc-comment.js';
+import { getDocComment, isBotAuthoredReply, hasBotSentinel, commentTriggerAllowed, fetchDocTitle, BOT_REPLY_SENTINEL, addCommentReactionChecked } from './doc-comment.js';
 import {
   BOTMUX_REQUIRED_SCOPES,
   DOC_FEATURE_SCOPES,
@@ -2105,6 +2105,24 @@ export function evaluateTalk(
   return { allowed: false, reason: 'none' };
 }
 
+
+/**
+ * defaultOncall 自动绑定必须在 talk 判定（evaluateTalk / evaluateBotTalk）之前完成：
+ * 已开 defaultOncall 的群，绑定是「首条被观察到的消息」时懒写入的；若先判权限，
+ * oncallChats 里还没有该 chat → 判无权限 → 误弹自助授权申请卡。
+ *
+ * 人、bot 两条路径都要调：新拉的告警群里第一个开口的常常是外部告警 bot，
+ * 只在人路径绑定会让它的首条 @ 必弹授权卡（oncall 群对 bot 本应直接放行）。
+ * 绑定是 chat 维度的策略、与 sender 无关；ensureDefaultOncallBound 自带
+ * fast-path 短路且 idempotent，失败只记日志、不阻断后续判定。
+ */
+async function bindDefaultOncallBeforeTalk(
+  larkAppId: string, chatId: string, chatType: ChatKind,
+): Promise<void> {
+  await ensureDefaultOncallBound(larkAppId, chatId, chatType).catch(err =>
+    logger.warn(`[oncall:${larkAppId}] pre-permission auto-bind failed for ${chatId.substring(0, 12)}: ${err}`),
+  );
+}
 /**
  * BOT 发送方的 talk 判定 —— bot 路由闸（外部 bot @ 本 bot）的**唯一**入口。
  *
@@ -3738,6 +3756,10 @@ async function processCommentEvent(
       ownerOpenId: operatorOpenId || getOwnerOpenId(larkAppId),
       workingDir: mappedDir,
       createdAt: Date.now(),
+      // 溯源：这条是「文档里有人 @bot」自动建出来的，不是 owner 主动登记。
+      autoCreated: true,
+      autoCreatedBy: operatorOpenId,
+      autoCreatedAt: Date.now(),
     };
     putDocSubscription(config.session.dataDir, larkAppId, autoSub);
     sub = autoSub;
@@ -3753,6 +3775,13 @@ async function processCommentEvent(
   // 历史脏记录（旧版本留下的未审计订阅）和并发窗口（事件 A 刚 put、事件 B 就读到）
   // 都会让未授权的订阅看起来像既有授权。授权判据只有审计门本身。
   const rollbackAutoSub = () => { if (autoCreatedSub) removeDocSubscription(config.session.dataDir, larkAppId, fileToken); };
+
+  // 记一条运行态诊断（dashboard「最近一次结局」用）。记到**活下来的那行**：本次
+  // auto-sub 被回滚时无行可记（读后写、行不存在返回 false）。各出口先回滚后记录；
+  // 当前顺序不承重，但能防住将来有人把 record 改成 upsert 而复活未授权订阅。绝不 throw。
+  const noteOutcome = (outcome: DocWatchOutcome, error?: string): void => {
+    recordDocWatchActivity(config.session.dataDir, larkAppId, fileToken, { outcome, error });
+  };
 
   // 「这条事件**可能**与本 bot 有关，且丢了就真的没了」—— 读不到评论正文时唯一
   // 能用的收窄。两个条件都必须满足才允许打那个**终态、不清理**的 ❌：
@@ -3798,9 +3827,9 @@ async function processCommentEvent(
       );
       logger.info(`[doc-comment] dropped-signal outcome=${outcome} (取不到评论内容) comment=${commentId.slice(0, 12)}`);
     } else {
-      // 没打标记 = 从未过审计，auto-sub 占位必须回滚（同 !trigger 分支）。
       rollbackAutoSub();
     }
+    noteOutcome('no-comment');
     return;
   }
   const trigger = parsed.replyId
@@ -3825,10 +3854,10 @@ async function processCommentEvent(
       );
       logger.info(`[doc-comment] dropped-signal outcome=${outcome} (触发回复不在拉到的回复里) comment=${commentId.slice(0, 12)}`);
     } else {
-      // 没打标记 = 这条事件从未过审计。auto-sub 是这次事件建的占位，必须回滚，
-      // 否则陌生人的一条无关回复就留下 owner 不知情的订阅。
+      // 没打标记 = 这条事件从未过审，auto-sub 占位必须回滚。
       rollbackAutoSub();
     }
+    noteOutcome('trigger-missing');
     return;
   }
   const triggerIndex = Math.max(0, comment.replies.indexOf(trigger));
@@ -3844,16 +3873,19 @@ async function processCommentEvent(
   if ((selfBotOpenId && trigger.userId === selfBotOpenId) || isBotAuthoredReply(trigger.replyId) || hasBotSentinel(trigger.text)) {
     // 这条事件不会走到审计门，本次 auto-sub 占位必须回滚（同下面 mention gate）。
     rollbackAutoSub();
+    noteOutcome('self-authored');
     return;
   }
 
-  // 4) 触发范围闸（mention-only 仅当评论真的 @ 了本 bot 才触发）。
+  // 4) 触发范围闸：mention-only 仅当评论真的 @ 了本 bot；owner-mention 还允许 @ 了
+  //    订阅负责人（sub.ownerOpenId）。
   //    ⚠️ 必须以拉到的评论正文 @person(open_id) 列表为准，不能信事件自带的
   //    `is_mentioned`——它表示「评论里存在任意 @」，@ 别人时也是 true，曾导致
   //    「@ 同事的评论也被误触发」。详见 commentTriggerAllowed 注释。
-  if (!commentTriggerAllowed(sub.commentTriggerMode, trigger.mentions, selfBotOpenId)) {
+  if (!commentTriggerAllowed(sub.commentTriggerMode, trigger.mentions, selfBotOpenId, sub.ownerOpenId)) {
     logger.info(`[doc-comment] event dropped: mention-only 但未 @ 本 bot (comment=${commentId.slice(0, 12)} isMentioned=${parsed.isMentioned} mentions=${trigger.mentions.length} self=${selfBotOpenId ? selfBotOpenId.slice(0, 10) : '?'})`);
     rollbackAutoSub();
+    noteOutcome('not-mentioned');
     return;
   }
 
@@ -3885,6 +3917,7 @@ async function processCommentEvent(
     } else {
       rollbackAutoSub();
     }
+    noteOutcome('empty-text');
     return;
   }
 
@@ -3893,7 +3926,10 @@ async function processCommentEvent(
   // （owner 自己触发的不通知，直接放行。）
   // 走同一个 helper —— 「回复」和「失败标记」共用一套规则，规则分叉迟早会让
   // 其中一条悄悄绕过审计（本 PR 就险些如此）。这里传的是真实评论正文摘要。
-  if (!await passesDocCommentAuditGate(larkAppId, fileToken, requesterOpenId, text, rollbackAutoSub)) return;
+  if (!await passesDocCommentAuditGate(larkAppId, fileToken, requesterOpenId, text, rollbackAutoSub)) {
+    noteOutcome('audit-rejected');
+    return;
+  }
 
   const delivery: DocCommentContext = {
     larkAppId,
@@ -3910,6 +3946,13 @@ async function processCommentEvent(
     authorOpenId: trigger.userId,
   };
   logger.info(`[doc-comment] dispatch file=${fileToken.slice(0, 12)} comment=${commentId.slice(0, 12)} mode=${sub.commentTriggerMode} → session anchor=${sub.sessionAnchor.slice(0, 12)}`);
+  // 标题补齐（只在缺时补，**故意不 await**）：评论事件热路径，用户在等回复，不能
+  // 为显示字段插一次同步飞书往返。下条评论还会再试，列表期间回退显示 token。
+  if (!sub.docTitle) {
+    void fetchDocTitle(larkAppId, { fileToken, fileType: sub.fileType })
+      .then(title => { if (title) setDocTitle(config.session.dataDir, larkAppId, fileToken, title); })
+      .catch(() => { /* 显示字段，best-effort */ });
+  }
   let accepted = false;
   let deliveryError: unknown;
   try {
@@ -3933,6 +3976,9 @@ async function processCommentEvent(
     },
     accepted,
   );
+  // 只在 daemon 真接纳后记 dispatched；未接纳落 pending 由 poller 重试，提前记成功
+  // 会让界面在重试/失败时显示一个不成立的成功结局。
+  if (accepted) noteOutcome('dispatched');
   if (!accepted) {
     logger.warn(
       `[doc-comment] WS delivery not accepted; retry outcome=${retryOutcome} `
@@ -4352,6 +4398,7 @@ export function createLarkEventDispatcherRuntime(
             // 仍只归 owner；此刻不建 session，绝不把触发 bot 写成 owner，也不 --mention-back
             // 回唤它（dispatchHumanMessage 那条才建 session，本分支只发卡后 return）。
             if (autoTopic) {
+              await bindDefaultOncallBeforeTalk(larkAppId, chatId, chatType);
               const seedBotTalk = evaluateBotTalk(larkAppId, chatId, senderOpenId, senderUnionId);
               if (!seedBotTalk.allowed) {
                 // 黑名单 bot 静默吞掉：不自动开工、不发授权卡、不做 sibling 自愈。
@@ -4391,6 +4438,7 @@ export function createLarkEventDispatcherRuntime(
         // bot 能不能在本会话说话：此处只判定一次，紧随的 p2p promote、下方 fold 的
         // mentionedThisBot 以及再往后的 talk gate 共用同一结论；之间只有路由计算，
         // 不改授权状态（曾是两条手抄 OR 链，漏一处即「能路由但不能 fold」类二次分裂）。
+        await bindDefaultOncallBeforeTalk(larkAppId, chatId, chatType);
         const botTalk = evaluateBotTalk(larkAppId, chatId, senderOpenId, senderUnionId);
         if (botTalk.allowed) {
           await promoteExplicitP2pTopicIfNeeded({
@@ -4491,12 +4539,7 @@ export function createLarkEventDispatcherRuntime(
       if (primary && isUnsupportedPrimarySessionlessCommand(message, senderOpenId)) {
         return ignoredUnsupportedPrimarySideEffect('sessionless commands');
       }
-      // defaultOncall 自动绑定必须在 canTalk 权限判断前完成，否则已开 defaultOncall
-      // 的群首次 @bot 时 oncallChats 中还没有该 chat → evaluateTalk 判无权限 → 误弹
-      // 自助授权申请卡。ensureDefaultOncallBound 本身带 fast-path 短路且 idempotent。
-      await ensureDefaultOncallBound(larkAppId, chatId, chatType).catch(err =>
-        logger.warn(`[oncall:${larkAppId}] pre-permission auto-bind failed for ${chatId.substring(0, 12)}: ${err}`),
-      );
+      await bindDefaultOncallBeforeTalk(larkAppId, chatId, chatType);
       // 人的路径（bot 发送方已在上面的分支 return）：union 走 memberUnionId 腿，
       // 不进 bot-trust 腿——teamBot 只认 bot-locked union。
       const isAllowed = canTalk(larkAppId, chatId, senderOpenId, undefined, humanSenderUnionId, chatType);

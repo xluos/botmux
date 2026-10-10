@@ -474,11 +474,13 @@ vi.mock('../src/im/lark/doc-comment.js', () => {
     listDocComments: vi.fn(async () => []),
     subscribeDocFile: vi.fn(async () => {}),
     unsubscribeDocFile: vi.fn(async () => {}),
+    fetchDocTitle: vi.fn(async () => undefined),
   };
 });
 
 vi.mock('../src/services/doc-subs-store.js', () => ({
   docWatchAnchor: (fileToken: string) => `doc:${fileToken}:watch`,
+  isPollingDocTriggerMode: (mode?: string) => mode === 'all' || mode === 'owner-mention',
   putDocSubscription: vi.fn(() => ({})),
   removeDocSubscription: vi.fn(),
   listDocSubscriptionsForSession: vi.fn(() => []),
@@ -2385,6 +2387,8 @@ describe('handleCommand', () => {
           workingDir: '/work/current-session',
           managedBy: 'watch-comment',
         }),
+        // 重新登记延续运行态诊断；溯源三字段刻意不传（owner 接管，不再是 auto-sub）。
+        { inheritRuntime: true },
       );
       expect(deps.sessionReply).toHaveBeenCalledWith(
         ROOT_ID,
@@ -2432,6 +2436,8 @@ describe('handleCommand', () => {
         expect.any(String),
         LARK_APP_ID,
         expect.objectContaining({ workingDir: undefined }),
+        // watch-comment 重登记走 inheritRuntime。
+        { inheritRuntime: true },
       );
       expect(deps.sessionReply).toHaveBeenCalledWith(
         ROOT_ID,
@@ -2469,6 +2475,7 @@ describe('handleCommand', () => {
           workingDir: '/work/repo',
           managedBy: 'watch-comment',
         }),
+        { inheritRuntime: true },
       );
       expect(deps.sessionReply).toHaveBeenCalledWith(
         ROOT_ID,
@@ -6106,14 +6113,37 @@ describe('handleCommand', () => {
         expect(text).toContain('两边都要授权');
       });
 
-      it('completes the pending challenge on done', async () => {
+      it.each([
+        { name: 'absent', policy: undefined, enabled: false, git: false },
+        { name: 'disabled', policy: { enabled: false }, enabled: false, git: false },
+        { name: 'lark only', policy: { enabled: true, tools: ['lark-cli'], gitHost: 'code.example.com' }, enabled: false, git: false },
+        { name: 'bytedcli', policy: { enabled: true, tools: ['bytedcli'] }, enabled: true, git: false },
+        { name: 'bytedcli with git', policy: { enabled: true, tools: ['bytedcli'], gitHost: 'code.example.com' }, enabled: true, git: true },
+      ])('reports saved authorization and the $name policy on done', async ({ policy, enabled, git }) => {
         vi.mocked(pendingBytedcliChallenge).mockReturnValue('tok-1');
         vi.mocked(completeBytedcliLogin).mockResolvedValue({ state: 'authorized' });
-        const deps = makeDeps(makeDaemonSession());
-        await handleCommand('/login', ROOT_ID, makeLarkMessage('/login bytedcli done'), deps, LARK_APP_ID);
+        const bot = defaultGetBot();
+        vi.mocked(getBot).mockReturnValue({
+          ...bot,
+          config: { ...bot.config, triggerUserAuth: parseTriggerUserAuthConfig(policy) ?? undefined },
+        } as any);
+        for (const command of ['/login bytedcli done', '/login done']) {
+          const deps = makeDeps(makeDaemonSession());
+          await handleCommand('/login', ROOT_ID, makeLarkMessage(command), deps, LARK_APP_ID);
 
-        expect(completeBytedcliLogin).toHaveBeenCalledWith('ou_sender', 'tok-1');
-        expect((deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1]).toContain('授权成功');
+          expect(completeBytedcliLogin).toHaveBeenCalledWith('ou_sender', 'tok-1');
+          const text = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
+          expect(text).toContain('授权已保存');
+          if (enabled) {
+            expect(text).toContain('已为 bytedcli 启用');
+            expect(text).not.toContain('triggerUserAuth.enabled');
+          } else {
+            expect(text).toContain('triggerUserAuth.enabled');
+            expect(text).toContain('triggerUserAuth.tools');
+            expect(text).not.toContain('已为 bytedcli 启用');
+          }
+          expect(text.includes('code.example.com')).toBe(git);
+        }
       });
 
       // Not an error: they just have not clicked yet. Reporting a failure would

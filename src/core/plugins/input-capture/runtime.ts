@@ -4,7 +4,7 @@ import { parseCaptureAttachments, type CaptureAttachment } from './attachments.j
 
 export interface CaptureSession {
   sessionId: string; larkAppId: string; chatId: string; anchor: string;
-  ownerOpenId: string; active: boolean;
+  ownerOpenId: string; active: boolean; scope?: string; chatType?: string;
 }
 export interface InputCaptureOptions {
   larkAppId: string;
@@ -27,10 +27,14 @@ export function createInputCaptureRuntime(options: InputCaptureOptions) {
   let timer: ReturnType<typeof setInterval> | undefined;
   let running: Promise<void> | undefined;
   let stopped = false;
+  // A group-wide session has no personal owner. A binding still selects one
+  // explicit actor, whose current native talk permission is checked separately.
+  const matchesOwner = (session: CaptureSession, actor: string) => session.ownerOpenId === actor
+    || !session.ownerOpenId && session.scope === 'chat' && session.chatType === 'group' && session.anchor === session.chatId;
   const matchesSession = (binding: InputBinding, session: CaptureSession | undefined): session is CaptureSession =>
     !!session && session.active && session.larkAppId === binding.larkAppId
       && session.sessionId === binding.sessionId && session.chatId === binding.chatId
-      && session.anchor === binding.sourceAnchor && session.ownerOpenId === binding.ownerOpenId;
+      && session.anchor === binding.sourceAnchor && matchesOwner(session, binding.ownerOpenId);
   async function flush() {
     // Preserve source order per binding. Offline / rejected inputs remain pending.
     const snapshot = store.readIndexed(); const journal = snapshot.state; const blocked = new Set<string>();
@@ -60,13 +64,15 @@ export function createInputCaptureRuntime(options: InputCaptureOptions) {
   return {
     register(sessionId: string, body: Record<string, unknown>) {
       if (!valid(body.pluginId, 100) || !valid(body.requestId, 128) || !valid(body.providerRef, 1000)
+        || body.actorOpenId !== undefined && (typeof body.actorOpenId !== 'string' || !/^ou_[A-Za-z0-9_-]+$/.test(body.actorOpenId))
         || body.inputThreadId !== undefined && !validThread(body.inputThreadId)
         || body.captureAttachments !== undefined && typeof body.captureAttachments !== 'boolean'
         || body.inputAnchor !== undefined && (typeof body.inputAnchor !== 'string' || !/^om_[A-Za-z0-9_-]+$/.test(body.inputAnchor))) throw new Error('invalid_input_capture_request');
       const session = options.session(sessionId);
-      if (!session || session.sessionId !== sessionId || !session.active || session.larkAppId !== larkAppId || !/^ou_[A-Za-z0-9_-]+$/.test(session.ownerOpenId)
+      const actorOpenId = (body.actorOpenId ?? session?.ownerOpenId) as string;
+      if (!session || session.sessionId !== sessionId || !session.active || session.larkAppId !== larkAppId || !/^ou_[A-Za-z0-9_-]+$/.test(actorOpenId) || !matchesOwner(session, actorOpenId)
         || !/^oc_[A-Za-z0-9_-]+$/.test(session.chatId) || !/^(?:om_|oc_)[A-Za-z0-9_-]+$/.test(session.anchor)
-        || !options.canTalk(session, session.ownerOpenId)) throw new Error('input_capture_session_unavailable');
+        || !options.canTalk(session, actorOpenId)) throw new Error('input_capture_session_unavailable');
       if (!options.pluginEnabled(body.pluginId)) throw new Error('input_capture_plugin_unavailable');
       const anchor = (body.inputAnchor ?? session.anchor) as string;
       if (body.inputThreadId !== undefined && !anchor.startsWith('om_')) throw new Error('invalid_input_capture_request');
@@ -74,16 +80,16 @@ export function createInputCaptureRuntime(options: InputCaptureOptions) {
       return store.transact((state, snapshot) => {
         const prior = state.bindings.find(b => b.id === id);
         if (prior) {
-          if (!matchesSession(prior, session) || prior.providerRef !== body.providerRef || prior.anchor !== anchor
+          if (!matchesSession(prior, session) || prior.ownerOpenId !== actorOpenId || prior.providerRef !== body.providerRef || prior.anchor !== anchor
             || prior.inputThreadId !== body.inputThreadId
             || !!prior.captureAttachments !== !!body.captureAttachments) throw new Error('input_capture_identity_conflict');
           return prior;
         }
         if (state.bindings.some(b => b.active && b.chatId === session.chatId
-          && b.ownerOpenId === session.ownerOpenId && (b.anchor === anchor
+          && b.ownerOpenId === actorOpenId && (b.anchor === anchor
             || typeof body.inputThreadId === 'string' && bindingThreads(snapshot, b).has(body.inputThreadId)))) throw new Error('input_capture_anchor_conflict');
         const binding: InputBinding = { id, revision: 1, active: true, larkAppId, sessionId,
-          chatId: session.chatId, anchor, sourceAnchor: session.anchor, ownerOpenId: session.ownerOpenId,
+          chatId: session.chatId, anchor, sourceAnchor: session.anchor, ownerOpenId: actorOpenId,
           pluginId: body.pluginId as string, requestId: body.requestId as string, providerRef: body.providerRef as string,
           createdAt: new Date().toISOString(), ...(body.captureAttachments === true ? { captureAttachments: true } : {}),
           ...(typeof body.inputThreadId === 'string' ? { inputThreadId: body.inputThreadId } : {}) };

@@ -65,12 +65,12 @@ import { validateAdoptTarget, adoptTargetKey, adoptTargetLabel, type AdoptableSe
 import { validateZellijAdoptTarget, type ZellijAdoptableSession } from './zellij-adopt-discovery.js';
 import { listCodexAppThreads, type CodexAppThreadSummary } from '../services/codex-app-threads.js';
 import { generateAuthUrl, getTokenStatus, resolveUserToken, listAuthorizedUsers, resolveOAuthRedirectUri, DOC_COMMENT_OAUTH_SCOPES, FEED_GROUP_OAUTH_SCOPES } from '../utils/user-token.js';
-import { DocSubscriptionPermissionError, listDocComments, resolveDocFile, subscribeDocFile, unsubscribeDocFile } from '../im/lark/doc-comment.js';
+import { DocSubscriptionPermissionError, fetchDocTitle, listDocComments, resolveDocFile, subscribeDocFile, unsubscribeDocFile } from '../im/lark/doc-comment.js';
 import { parseDocWatchCommand } from './doc-watch-command.js';
 import { parseVcMeetingPrepareCommand } from './vc-meeting-prepare-command.js';
 import { latestDocCommentPollCursor } from './doc-comment-poller.js';
 import {
-  docWatchAnchor, putDocSubscription, removeDocSubscription, listDocSubscriptionsForSession, listAllDocSubscriptions, getDocSubscription,
+  docWatchAnchor, putDocSubscription, removeDocSubscription, listDocSubscriptionsForSession, listAllDocSubscriptions, getDocSubscription, isPollingDocTriggerMode,
   type CommentTriggerMode, type DocSubscription,
 } from '../services/doc-subs-store.js';
 import {
@@ -1161,6 +1161,19 @@ async function applyAllowedUsersSet(
     return;
   }
   await reply(t('cmd.config.allow_ok', { count: r.resolved.length, total: r.raw.length }, loc));
+}
+
+function bytedcliLoginSuccessReply(botConfig: BotConfig, locale: Locale): string {
+  const policy = botConfig.triggerUserAuth;
+  const enabled = triggerUserAuthApplies(policy, 'bytedcli');
+  const lines = [
+    t('cmd.login.bytedcli_ok', undefined, locale),
+    t(enabled ? 'cmd.login.bytedcli_enabled' : 'cmd.login.bytedcli_configure', undefined, locale),
+  ];
+  if (enabled && policy?.gitHost) {
+    lines.push(t('cmd.login.bytedcli_git_enabled', { host: policy.gitHost }, locale));
+  }
+  return lines.join('\n');
 }
 
 /**
@@ -3672,7 +3685,7 @@ export async function handleCommand(
           if (bytedPending) {
             const { state, detail } = await completeBytedcliLogin(loginOpenId, bytedPending);
             doneLines.push(state === 'authorized'
-              ? t('cmd.login.bytedcli_ok', undefined, loc)
+              ? bytedcliLoginSuccessReply(botCfg2, loc)
               : state === 'pending'
                 ? t('cmd.login.bytedcli_pending', undefined, loc)
                 : state === 'unavailable'
@@ -3787,7 +3800,7 @@ export async function handleCommand(
             }
             const { state, detail } = await completeBytedcliLogin(loginOpenId, challenge);
             await sessionReply(rootId, state === 'authorized'
-              ? t('cmd.login.bytedcli_ok', undefined, loc)
+              ? bytedcliLoginSuccessReply(botCfg2, loc)
               : state === 'pending'
                 ? t('cmd.login.bytedcli_pending', undefined, loc)
                 : state === 'unavailable'
@@ -3855,7 +3868,7 @@ export async function handleCommand(
         const anchor = sessionAnchorId(ds);
         const dataDir = config.session.dataDir;
         const modeLabel = (m: CommentTriggerMode) =>
-          t(m === 'all' ? 'cmd.subdoc.mode_all' : 'cmd.subdoc.mode_mention', undefined, loc);
+          t(m === 'all' ? 'cmd.subdoc.mode_all' : m === 'owner-mention' ? 'cmd.subdoc.mode_owner_mention' : 'cmd.subdoc.mode_mention', undefined, loc);
 
         if (arg === 'list' || arg === '列表') {
           const subs = listDocSubscriptionsForSession(dataDir, larkAppId, anchor)
@@ -3959,7 +3972,7 @@ export async function handleCommand(
         const request = parseDocWatchCommand(message.content);
         const dataDir = config.session.dataDir;
         const modeLabel = (m: CommentTriggerMode) =>
-          t(m === 'all' ? 'cmd.subdoc.mode_all' : 'cmd.subdoc.mode_mention', undefined, loc);
+          t(m === 'all' ? 'cmd.subdoc.mode_all' : m === 'owner-mention' ? 'cmd.subdoc.mode_owner_mention' : 'cmd.subdoc.mode_mention', undefined, loc);
 
         if (request.kind === 'usage' || request.kind === 'invalid') {
           const prefix = request.kind === 'invalid' && request.reason === 'conflicting_modes'
@@ -4046,9 +4059,11 @@ export async function handleCommand(
           let pollCursorAt: number | undefined;
           let pollCursorReplyId: string | undefined;
           let pollBaselineReady: boolean | undefined;
-          if (mode === 'all') {
+          if (isPollingDocTriggerMode(mode)) {
+            // 轮询模式（all / owner-mention）共用游标基线；在两种轮询模式之间互切可
+            // 直接复用，从 mention-only 切进来才需要新建/置待建。
             const canReuseBaseline = existing?.managedBy === 'watch-comment'
-              && existing.commentTriggerMode === 'all'
+              && isPollingDocTriggerMode(existing.commentTriggerMode)
               && existing.pollBaselineReady === true;
             if (canReuseBaseline) {
               pollCursorAt = existing.pollCursorAt;
@@ -4083,7 +4098,13 @@ export async function handleCommand(
             pollBaselineReady,
             createdAt: existing?.createdAt ?? Date.now(),
           };
-          const { previous } = putDocSubscription(dataDir, larkAppId, subscription);
+          // 标题快照 best-effort，取不到留 undefined。放 put 前一起写省一次盘写。
+          const fetchedTitle = await fetchDocTitle(larkAppId, file);
+          if (fetchedTitle) subscription.docTitle = fetchedTitle;
+          else if (existing?.docTitle) subscription.docTitle = existing.docTitle;
+          // inheritRuntime：重登记延续投递计数/最近结局；溯源三字段刻意不传——owner
+          // 主动 /watch-comment 意味着这条不再是陌生人 @ 出来的 auto-sub。
+          const { previous } = putDocSubscription(dataDir, larkAppId, subscription, { inheritRuntime: true });
           const rebound = previous && previous.sessionAnchor !== anchor;
           let replyText = t(!ds ? 'cmd.watch.started_lazy' : rebound ? 'cmd.watch.started_moved' : 'cmd.watch.started', {
             title: file.fileToken.slice(0, 12),

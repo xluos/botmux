@@ -482,7 +482,11 @@ import {
   updateSessionTitle,
 } from './core/session-title.js';
 import { settleDeferredScheduleRun } from './core/deferred-schedule-settlement.js';
-import { renderMessageListenerPrompt, refreshListenerCardTextFromResolved } from './services/message-listener.js';
+import {
+  renderMessageListenerPrompt,
+  refreshListenerCardTextFromResolved,
+  refreshListenerForwardTextFromParsed,
+} from './services/message-listener.js';
 import { renderCommandTriggerPrompt } from './services/command-trigger.js';
 import { sweepOrphanSandboxes } from './adapters/backend/sandbox.js';
 import { sweepOrphanScratchSandboxes } from './adapters/backend/scratch-sandbox.js';
@@ -643,8 +647,8 @@ function republishResolvedAllowedUsers(larkAppId: string, resolved: string[]): v
 }
 let vcMeetingTerminalReconciler: VcMeetingTerminalReconciler | undefined;
 import { isBotMentioned, getGroupStats, probeBotOpenId, createLarkEventDispatcherRuntime, startLarkEventDispatcher, markForwardFollowupsSessionsReady, writeBotInfoFile, canOperate, canRunDaemonCommand, evaluateTalk, evaluateBotTalk, evaluateAskAnswerTalk, askCustomReplyCandidate, grantCommandRestriction, isKnownPeerBot, resolveSiblingBotNameByUnionId, checkRequiredScopes, ensureVcMeetingEventsSubscribed, ensureMessageUpdatedEventSubscribed, ensureMessageRecalledEventSubscribed, type RoutingContext, type TalkEvaluation, type DocCommentContext, type EventHandlers } from './im/lark/event-dispatcher.js';
-import { commitDocCommentPollCursor, docCommentThreadAnchor, getDocSubscription, isDocNativeWatchSubscription, listAllDocSubscriptions, listDocSubscriptionsForSession, normalizeDocNativeWatchSubscription, putDocSubscription, removeDocSubscription, settleDocCommentWsDelivery, type DocSubscription } from './services/doc-subs-store.js';
-import { BOT_REPLY_SENTINEL, subscribeDocFile, unsubscribeDocFile, addCommentReaction, removeCommentReaction, hasBotSentinel, isBotAuthoredReply, listDocComments } from './im/lark/doc-comment.js';
+import { commitDocCommentPollCursor, docCommentThreadAnchor, getDocSubscription, isDocNativeWatchSubscription, isPollingDocTriggerMode, listAllDocSubscriptions, listDocSubscriptionsForSession, normalizeDocNativeWatchSubscription, putDocSubscription, recordDocWatchActivity, removeDocSubscription, settleDocCommentWsDelivery, type DocSubscription } from './services/doc-subs-store.js';
+import { BOT_REPLY_SENTINEL, subscribeDocFile, unsubscribeDocFile, addCommentReaction, removeCommentReaction, hasBotSentinel, isBotAuthoredReply, listDocComments, polledReplyTriggerAllowed } from './im/lark/doc-comment.js';
 import { learnFromMentions, resolveSender, flushIdentityCacheSync, type ResolvedSender } from './im/lark/identity-cache.js';
 import { normalizeBrand } from './im/lark/lark-hosts.js';
 import { buildDocCommentTurnInput, buildDocWatchWarmupTurnInput } from './core/doc-comment-prompt.js';
@@ -861,6 +865,7 @@ import {
 } from './services/vc-meeting-im-routing.js';
 import { VC_MEETING_HUMAN_IM_OUTPUT_CONTRACT } from './services/vc-meeting-listener-output-protocol.js';
 import { loopbackFetch } from './core/loopback-fetch.js';
+import { decideTurnIdleReport } from './utils/turn-idle-report.js';
 
 // ─── State ───────────────────────────────────────────────────────────────────
 
@@ -7929,6 +7934,109 @@ ipcRoute('POST', '/api/session-ready', async (req, res) => {
     const acknowledged = await ack;
     if (!acknowledged) {
       logger.warn(`[${sessionId.slice(0, 8)}] session-ready worker ACK timed out; allowing hook to continue`);
+    }
+  }
+  return jsonRes(res, 200, { ok: true });
+});
+
+// ─── turn-idle IPC route (internal: 结构化回合空闲信号) ────────────────────────
+//
+// NOT an agent-facing command. CLI 进程内的结构化集成——当前只有 dsh-tui 的
+// cordis wrapper 插件，在 `agent/status` 落到 idle（回合结束）时——经
+// `botmux turn-idle`（cli.ts cmdTurnIdle）调到这里；daemon 把信号连同上报者读到
+// 的回合身份一起转给该会话的 worker，worker 只在身份与自己当前回合逐字相符时才
+// `idleDetector.fireIdle()`（判定见 utils/turn-idle-report.ts）。
+//
+// 为什么带的是**上报者声明的** turnId/dispatchAttempt，而不是 daemon 自己的
+// managedTurnOrigin：worker 侧那道 fence 要判的是「上报时到底哪一轮在跑」。daemon
+// 的副本可能已经推进到下一轮（更接近 worker 的实时值），转发它只会削弱 fence；
+// 声明的值由 dsh-tui 插件在 `agent/status` 回调里当场冻结（协议 v2），最保守。
+// capability 仍是唯一凭据，且这里把**声明回合与该 capability 的 live origin 绑定**
+// （同一 fence：声明必须逐字等于 token 所对应的 origin 元组）——光有 token 只能证明
+// 「呼叫方持有本会话当前 token」，不能证明它说的那一轮。绑定失败一律 403，不转发。
+//
+// 鉴权与 /api/session-ready 同构（能读 host secret 走 HMAC，沙箱内走本会话
+// rotating per-turn capability），但**不放行 receiver 会话**：按
+// authorizeSessionScopedIpc 的契约，只有「不可观测」的路由才允许 receiver，而本路由
+// 会释放 worker 的输入闸门（可能产生写入），属可观测副作用。VC-meeting receiver 会话
+// 因此退回既有兜底路径，无回归。找不到会话 / worker 仍返回 200（best-effort）：
+// 丢一个回合空闲不致命，worker 侧还有既有兜底路径。
+ipcRoute('POST', '/api/turn-idle', async (req, res) => {
+  let raw: {
+    sessionId?: unknown;
+    originCapability?: unknown;
+    originTurnId?: unknown;
+    originDispatchAttempt?: unknown;
+    seq?: unknown;
+    pid?: unknown;
+  };
+  try {
+    raw = await readJsonBody(req);
+  } catch {
+    return jsonRes(res, 400, { ok: false, error: 'bad_json' });
+  }
+  const sessionId = typeof raw.sessionId === 'string' ? raw.sessionId : '';
+  if (!sessionId) return jsonRes(res, 400, { ok: false, error: 'missing_sessionId' });
+
+  let ds: DaemonSession | undefined;
+  for (const s of activeSessions.values()) {
+    if (s.session.sessionId === sessionId) { ds = s; break; }
+  }
+  const positiveInt = (value: unknown): number | undefined => (
+    typeof value === 'number' && Number.isSafeInteger(value) && value > 0 ? value : undefined
+  );
+  if (!isTrustedHostIpcRequest(req)) {
+    const claimedTurnId = typeof raw.originTurnId === 'string' ? raw.originTurnId : undefined;
+    const claimedDispatchAttempt = positiveInt(raw.originDispatchAttempt);
+    const verified = authorizeSessionScopedIpc({
+      trustedHost: false,
+      sessionExists: !!ds,
+      receiverSession: !!ds?.session.vcMeetingReceiver,
+      allowReceiver: false,
+      sessionId,
+      liveOrigin: ds?.managedTurnOrigin,
+      claimedCapability: typeof raw.originCapability === 'string'
+        ? raw.originCapability
+        : undefined,
+      claimedTurnId,
+      claimedDispatchAttempt,
+    });
+    if (!verified.ok) {
+      return jsonRes(res, 403, {
+        ok: false,
+        error: verified.error,
+      });
+    }
+    // The capability only proves "the caller holds this session's CURRENT
+    // per-dispatch token" — it says nothing about the turn the report claims.
+    // Bind the two: the claim must name exactly the origin the token was
+    // published for (same fence as the worker's, applied here). A reporter that
+    // presents a live token with somebody else's tuple, or a legacy payload
+    // without one, is refused rather than forwarded.
+    const binding = decideTurnIdleReport({
+      reportedTurnId: claimedTurnId,
+      reportedDispatchAttempt: claimedDispatchAttempt,
+      activeTurnId: ds?.managedTurnOrigin?.turnId,
+      activeDispatchAttempt: ds?.managedTurnOrigin?.dispatchAttempt,
+      promptReady: false,
+    });
+    if (!binding.accept) {
+      logger.warn(`[${sessionId.slice(0, 8)}] turn-idle claim refused (${binding.reason})`);
+      return jsonRes(res, 403, { ok: false, error: 'origin_identity_mismatch' });
+    }
+  }
+  if (ds?.worker) {
+    try {
+      ds.worker.send({
+        type: 'turn_idle',
+        turnId: typeof raw.originTurnId === 'string' ? raw.originTurnId : undefined,
+        dispatchAttempt: positiveInt(raw.originDispatchAttempt),
+        seq: positiveInt(raw.seq),
+        pid: positiveInt(raw.pid),
+      } as DaemonToWorker);
+      logger.info(`[${sessionId.slice(0, 8)}] turn-idle signal forwarded to worker (turn=${typeof raw.originTurnId === 'string' ? raw.originTurnId.slice(0, 12) : '?'})`);
+    } catch (err) {
+      logger.warn(`turn-idle forward failed: ${err instanceof Error ? err.message : String(err)}`);
     }
   }
   return jsonRes(res, 200, { ok: true });
@@ -22619,7 +22727,10 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
   const botCfg = getBot(larkAppId).config;
   // Upgrade a card match's text/title from the resolved message (button URLs the
   // simplified match-time view dropped). See refreshListenerCardTextFromResolved.
-  if (messageListener) refreshListenerCardTextFromResolved(messageListener, data.message);
+  if (messageListener) {
+    refreshListenerCardTextFromResolved(messageListener, data.message);
+    refreshListenerForwardTextFromParsed(messageListener, parsed.content);
+  }
   const listenerPrompt = messageListener ? renderMessageListenerPrompt(messageListener) : undefined;
   if (listenerPrompt) {
     content = listenerPrompt;
@@ -24685,6 +24796,7 @@ async function handleThreadReplyAdmitted(
   let listenerPrompt: string | undefined;
   if (ctx.messageListener) {
     refreshListenerCardTextFromResolved(ctx.messageListener, data.message);
+    refreshListenerForwardTextFromParsed(ctx.messageListener, parsed.content);
     listenerPrompt = renderMessageListenerPrompt(ctx.messageListener);
   }
   if (listenerPrompt) {
@@ -27454,6 +27566,9 @@ async function retryPendingDocCommentDeliveries(
         const retained = latest?.pendingDocCommentDeliveries?.some(candidate =>
           (candidate.replyId || candidate.commentId) === key);
         if (retained) acceptedKeys.add(`${snapshot.fileToken}:${key}`);
+        // 无论 --all（留 acceptedAt 等游标提交）还是 mention-only（直接移除），此刻
+        // daemon 已真接纳 ⟹ 记一次投递。
+        recordDocWatchActivity(config.session.dataDir, larkAppId, snapshot.fileToken, { outcome: 'dispatched' });
         logger.info(`[doc-comment-retry] accepted file=${snapshot.fileToken.slice(0, 12)} reply=${key.slice(0, 12)}`);
       } catch (err) {
         blockedFiles.add(snapshot.fileToken);
@@ -27479,7 +27594,7 @@ async function pollWatchedDocComments(larkAppId: string): Promise<void> {
   try {
     const pendingRetry = await retryPendingDocCommentDeliveries(larkAppId);
     const subs = listAllDocSubscriptions(config.session.dataDir, larkAppId)
-      .filter(sub => sub.managedBy === 'watch-comment' && sub.commentTriggerMode === 'all');
+      .filter(sub => sub.managedBy === 'watch-comment' && isPollingDocTriggerMode(sub.commentTriggerMode));
     for (const snapshot of subs) {
       try {
         if (pendingRetry.blockedFiles.has(snapshot.fileToken)) continue;
@@ -27489,7 +27604,7 @@ async function pollWatchedDocComments(larkAppId: string): Promise<void> {
         });
         const latest = latestDocCommentPollCursor(comments);
         const current = getDocSubscription(config.session.dataDir, larkAppId, snapshot.fileToken);
-        if (!current || current.managedBy !== 'watch-comment' || current.commentTriggerMode !== 'all') continue;
+        if (!current || current.managedBy !== 'watch-comment' || !isPollingDocTriggerMode(current.commentTriggerMode)) continue;
         const acceptedPending = current.pendingDocCommentDeliveries?.filter(item => item.acceptedAt !== undefined) ?? [];
         const visibleReplyIds = new Set(comments.flatMap(comment => comment.replies.map(reply => reply.replyId)));
         if (acceptedPending.some(item => !visibleReplyIds.has(item.replyId || item.commentId))) {
@@ -27520,7 +27635,7 @@ async function pollWatchedDocComments(larkAppId: string): Promise<void> {
           fresh,
           async (reply) => {
             const stillWatching = getDocSubscription(config.session.dataDir, larkAppId, current.fileToken);
-            if (!stillWatching || stillWatching.managedBy !== 'watch-comment' || stillWatching.commentTriggerMode !== 'all') {
+            if (!stillWatching || stillWatching.managedBy !== 'watch-comment' || !isPollingDocTriggerMode(stillWatching.commentTriggerMode)) {
               return false; // watch removed mid-loop → stop without advancing
             }
             const pendingKey = `${current.fileToken}:${reply.replyId}`;
@@ -27531,7 +27646,17 @@ async function pollWatchedDocComments(larkAppId: string): Promise<void> {
               || hasBotSentinel(reply.text);
             const text = reply.text.replaceAll(BOT_REPLY_SENTINEL, '').trim();
             if (isSelfReply || !text) return true; // safely skip; advance past it
-            logger.info(`[doc-comment-poll] dispatch file=${current.fileToken.slice(0, 12)} comment=${reply.commentId.slice(0, 12)} reply=${reply.replyId.slice(0, 12)}`);
+            // owner-mention（替身语义）：只有 @ 了订阅负责人（或 @ 了本 bot）才投递，
+            // 其余普通评论跳过（推进游标但不回复）。与 WS 闸共用同一谓词。
+            if (!polledReplyTriggerAllowed(
+              stillWatching.commentTriggerMode,
+              reply.mentions,
+              selfBotOpenId,
+              stillWatching.ownerOpenId,
+            )) {
+              return true;
+            }
+            logger.info(`[doc-comment-poll] dispatch file=${current.fileToken.slice(0, 12)} comment=${reply.commentId.slice(0, 12)} reply=${reply.replyId.slice(0, 12)} mode=${stillWatching.commentTriggerMode}`);
             const ok = await handleDocComment({
               larkAppId,
               sub: stillWatching,
@@ -27566,12 +27691,17 @@ async function pollWatchedDocComments(larkAppId: string): Promise<void> {
               },
               true,
             );
+            recordDocWatchActivity(config.session.dataDir, larkAppId, current.fileToken, { outcome: 'dispatched' });
             return true;
           },
           (reply) => { commitDocCommentPollCursor(config.session.dataDir, larkAppId, current.fileToken, reply); },
         );
       } catch (err) {
-        logger.warn(`[doc-comment-poll] file=${snapshot.fileToken.slice(0, 12)} failed: ${err instanceof Error ? err.message : String(err)}`);
+        const message = err instanceof Error ? err.message : String(err);
+        logger.warn(`[doc-comment-poll] file=${snapshot.fileToken.slice(0, 12)} failed: ${message}`);
+        // 应用身份读不到这篇文档（权限撤销 / 文档被删 / 网络）——功能「配着」却从此
+        // 一条都不触发，是 owner 最需要在界面上看到的静默故障。
+        recordDocWatchActivity(config.session.dataDir, larkAppId, snapshot.fileToken, { outcome: 'poll-failed', error: message });
       }
     }
   } finally {
@@ -29192,6 +29322,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
         if (!ds || ds.session.vcMeetingReceiver || !['chat', 'thread'].includes(ds.scope)) return undefined;
         return { sessionId: id, larkAppId: ds.larkAppId, chatId: ds.chatId,
           anchor: ds.scope === 'chat' ? ds.chatId : ds.session.rootMessageId,
+          scope: ds.scope, chatType: ds.chatType,
           ownerOpenId: ds.ownerOpenId ?? ds.session.ownerOpenId ?? '', active: ds.session.status === 'active' };
       },
       pluginEnabled: id => resolveEffectivePluginIds(getBot(cfg.larkAppId).config, readGlobalConfig()).includes(id)

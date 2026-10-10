@@ -11,11 +11,11 @@ import { parseInputCaptureCommand } from '../src/cli/input-capture.js';
 import type { InputBinding } from '../src/core/plugins/input-capture/store.js';
 const cleanup: (() => void | Promise<void>)[] = [];
 afterEach(async () => { for (const fn of cleanup.splice(0).reverse()) await fn(); });
-function setup() {
+function setup(ownerless = false) {
   const dir = mkdtempSync(join(tmpdir(), 'capture-ipc-')); cleanup.push(() => rmSync(dir, { recursive: true, force: true }));
   const store = createInputCaptureStore(dir, 'cli_capture');
   const runtime = createInputCaptureRuntime({ larkAppId: 'cli_capture', store,
-    session: id => id === 's' ? { sessionId: 's', larkAppId: 'cli_capture', chatId: 'oc_chat', anchor: 'oc_chat', ownerOpenId: 'ou_owner', active: true } : undefined,
+    session: id => id === 's' ? { sessionId: 's', larkAppId: 'cli_capture', chatId: 'oc_chat', anchor: 'oc_chat', ownerOpenId: ownerless ? '' : 'ou_owner', active: true, scope: 'chat', chatType: 'group' } : undefined,
     pluginEnabled: id => id === 'example', canTalk: () => true, deliver: async () => { throw new Error('offline'); } });
   cleanup.push(() => runtime.stop()); return { runtime, store };
 }
@@ -123,4 +123,19 @@ it.each([
   expect(f.store.read().inputs).toHaveLength(1);
   expect(f.store.read().inputs[0].text).toBe('Inspect only after Review passes');
   await f.runtime.drain();
+});
+
+it('uses the explicit group actor through the real host-authenticated CLI/IPC registration', async () => {
+  const f = setup(true); setInputCaptureRuntime('cli_capture', f.runtime); setLarkAppId('cli_capture'); setIpcAuthSecret('capture-test-secret');
+  const server = await startIpcServer({ port: 0, host: '127.0.0.1', authRequired: true }); cleanup.push(() => server.close());
+  const command = parseInputCaptureCommand(['register', '--bot', 'cli_capture', '--session', 's', '--plugin', 'example',
+    '--request', 'group', '--ref', 'question:group', '--actor', 'ou_owner']);
+  expect((await fetch(`http://127.0.0.1:${server.port}${command.path}`, command.init)).status).toBe(401);
+  const response = await fetchDaemonIpc(server.port, command.path, command.init, 'capture-test-secret');
+  expect(response.status).toBe(200);
+  expect((await response.json()).result).toMatchObject({ ownerOpenId: 'ou_owner', anchor: 'oc_chat' });
+  expect(captureInboundText({ sender: { sender_id: { open_id: 'ou_owner' }, sender_type: 'user' },
+    message: { message_id: 'om_group_answer', chat_id: 'oc_chat', chat_type: 'group', message_type: 'text',
+      content: JSON.stringify({ text: 'confirmed scope only' }) } }, f.runtime, () => false)).toBe(true);
+  expect(f.store.read().inputs).toHaveLength(1);
 });

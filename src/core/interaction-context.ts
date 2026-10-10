@@ -27,7 +27,8 @@ export function observeInteractionContext(
   const session = deps.findActive(request.sessionId);
   if (!session || session.sessionId !== request.sessionId || session.status !== 'active'
     || (session.larkAppId && session.larkAppId !== request.daemonAppId)) return fail(404, 'active_session_not_found');
-  if (!id(session.chatId) || !/^ou_[A-Za-z0-9_-]+$/.test(session.ownerOpenId ?? '')
+  const ownerlessGroup = !session.ownerOpenId && session.scope === 'chat' && session.chatType === 'group';
+  if (!id(session.chatId) || !ownerlessGroup && !/^ou_[A-Za-z0-9_-]+$/.test(session.ownerOpenId ?? '')
     || (session.scope !== 'chat' && session.scope !== 'thread') || session.vcMeetingReceiver
     || !['group', 'p2p'].includes(session.chatType ?? '')
     || session.scope === 'thread' && !/^om_[A-Za-z0-9_-]+$/.test(session.rootMessageId ?? '')) return fail(409, 'interaction_origin_unavailable');
@@ -35,12 +36,13 @@ export function observeInteractionContext(
   if (isDocNativeSession({ scope: session.scope, chatId: session.chatId }) || isHttpVirtualSession(session.chatId)) {
     return fail(409, 'interaction_origin_unavailable');
   }
-  const actorOpenId = (body.actorOpenId ?? session.ownerOpenId) as string;
+  const actorOpenId = body.actorOpenId ?? session.ownerOpenId;
+  if (typeof actorOpenId !== 'string') return fail(409, 'interaction_actor_required');
   const canTalk = deps.canTalk(request.daemonAppId, session.chatId, actorOpenId, session.chatType as 'group' | 'p2p') === true;
   return { status: 200, body: { ok: true, schemaVersion: 1, context: {
     larkAppId: request.daemonAppId, sessionId: session.sessionId, status: 'active',
     chatId: session.chatId, rootMessageId: session.scope === 'thread' ? session.rootMessageId : null,
-    scope: session.scope, chatType: session.chatType, ownerOpenId: session.ownerOpenId,
+    scope: session.scope, chatType: session.chatType, ownerOpenId: session.ownerOpenId || null,
     actorOpenId, canTalk, observedAt: new Date().toISOString(),
   } } };
 }

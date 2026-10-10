@@ -1,4 +1,5 @@
 import type { CodexAppTurnInput, TrustedCaller } from '../../types.js';
+import type { TriggerUserAuthConfig } from '../../services/trigger-user-auth.js';
 
 export interface PtyHandle {
   /** `false` means the backend rejected the write before it could confirm
@@ -190,7 +191,7 @@ export interface CliAdapter {
      *  system prompt: the session acts with ONE person's credentials while the
      *  on-disk store holds everyone else's, and nothing in the OS currently
      *  stops an agent from reading those files. Off → no extra prompt text. */
-    triggerUserAuth?: boolean;
+    triggerUserAuth?: TriggerUserAuthConfig;
     /** Env the CLI must forward to the SHELL COMMANDS it runs, not merely hold
      *  itself. Codex does not pass its own environment to shell subprocesses,
      *  so the trigger-user wrapper vars (BOTMUX_IDENTITY_BIN / ZDOTDIR /
@@ -587,6 +588,29 @@ export interface CliAdapter {
    *  the selector eats. undefined/false → no gate (every other CLI behaves
    *  exactly as before). */
   readonly injectsReadyHook?: boolean;
+
+  /** When true, the adapter injects `BOTMUX_TURN_IDLE_COMMAND`
+   *  (`botmux __turn-idle-v2`) so an integration running INSIDE the CLI process can
+   *  report a structured end-of-turn idle edge (dsh-tui: its cordis wrapper
+   *  plugin listens to `agent/status === 'idle'`). The worker forwards such a
+   *  report to `idleDetector.fireIdle()` only when it names the worker's own
+   *  current turn — a PTY-quiescence-free completion path for TUIs that
+   *  repaint while idle, and never a bypass of the turn fence.
+   *  undefined/false → no env, no channel (every other CLI is unchanged). */
+  readonly injectsTurnIdleHook?: boolean;
+
+  /** Explicit opt-in for `injectsReadyHook` adapters whose ready-gate fallback
+   *  must not pre-empt their own first-prompt hard cap: the fallback is aligned
+   *  with FIRST_PROMPT_HARD_TIMEOUT_MS instead of the shared 45s (see
+   *  `resolveReadySignalTimeoutMs`). Only dsh-tui sets it — it defers the first
+   *  prompt to a readyPattern that a type-ahead write would otherwise bypass at
+   *  ~45-51s, into a composer that may not be mounted yet.
+   *
+   *  Deliberately NOT derived from `deferFirstPromptTimeoutUntilReady` +
+   *  readyPattern: grok carries both flags, and moving its fallback from 45s to
+   *  90s would delay every first prompt by ~45s whenever its SessionStart signal
+   *  is missing. undefined/false → the shared 45s fallback, unchanged. */
+  readonly readyGateFallbackAlignedWithHardCap?: boolean;
 
   /** CLI-specific system hints injected into the initial prompt.
    *  e.g. "use Read tool for attachments", "don't use PlanMode" */

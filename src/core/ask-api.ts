@@ -46,6 +46,7 @@ export type AskApiBodyError =
   | 'duplicate_option_key'
   | 'bad_questions'
   | 'bad_question_shape'
+  | 'bad_inputMode'
   | 'bad_multiSelect'
   | 'bad_defaultSelectedKeys'
   | 'bad_requestId'

@@ -68,3 +68,20 @@ describe('current host interaction context', () => {
     for (const args of [[], ['--bot', 'app1'], ['--bot', 'app1', '--bot', 'app2'], ['--bot', '--session']]) expect(() => parseInteractionContextCommand(args)).toThrow();
   });
 });
+
+it('requires an explicit native-authorized actor for an ownerless group without assigning ownership', () => {
+  const group = { ...session, scope: 'chat', rootMessageId: '', ownerOpenId: undefined };
+  let allowed = true;
+  const canTalk = vi.fn(() => allowed);
+  const deps = { findActive: () => group, canTalk };
+  expect(observeInteractionContext({ ...request, body: { larkAppId: 'app1' } }, deps).status).toBe(409);
+  expect(canTalk).not.toHaveBeenCalled();
+  expect(observeInteractionContext(request, deps).body.context).toMatchObject({
+    ownerOpenId: null, actorOpenId: 'ou_owner', rootMessageId: null, canTalk: true,
+  });
+  expect(canTalk).toHaveBeenCalledWith('app1', 'oc_chat', 'ou_owner', 'group');
+  expect(group.ownerOpenId).toBeUndefined();
+  allowed = false;
+  expect(observeInteractionContext(request, deps).body.context).toMatchObject({ canTalk: false });
+  expect(observeInteractionContext(request, { ...deps, findActive: () => ({ ...group, chatType: 'p2p' }) }).status).toBe(409);
+});

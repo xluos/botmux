@@ -8,7 +8,7 @@ import { parseInputCaptureCommand } from '../src/cli/input-capture.js';
 import { parseInputCaptureConditions } from '../src/core/plugins/input-capture/conditions.js';
 const cleanups: (() => void | Promise<void>)[] = [];
 afterEach(async () => { for (const cleanup of cleanups.splice(0).reverse()) await cleanup(); });
-function fixture(overrides: Partial<InputCaptureOptions> = {}) {
+function fixture(overrides: Partial<InputCaptureOptions> = {}, registration: Record<string, unknown> = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'capture-')); cleanups.push(() => rmSync(dir, { recursive: true, force: true }));
   const store = createInputCaptureStore(dir, 'cli_example');
   const session = { sessionId: 's', larkAppId: 'cli_example', chatId: 'oc_chat', anchor: 'om_root', ownerOpenId: 'ou_owner', active: true };
@@ -16,7 +16,7 @@ function fixture(overrides: Partial<InputCaptureOptions> = {}) {
     pluginEnabled: p => p === 'example', canTalk: () => true,
     deliver: async () => { throw new Error('offline'); }, ...overrides };
   const runtime = createInputCaptureRuntime(options); cleanups.push(() => runtime.stop());
-  const binding = runtime.register('s', { pluginId: 'example', requestId: 'request', providerRef: 'opaque' });
+  const binding = runtime.register('s', { pluginId: 'example', requestId: 'request', providerRef: 'opaque', ...registration });
   const event = { messageId: 'om_reply', chatId: 'oc_chat', anchor: 'om_root', senderOpenId: 'ou_owner', text: 'continue only the first step', botSender: false };
   return { runtime, binding, event, options, store, session };
 }
@@ -267,4 +267,56 @@ it.each(['duplicate', 'sequence', 'owner', 'attachments', 'thread', 'alias'])('r
     }
   });
   expect(() => f.store.read()).toThrow();
+});
+
+it('binds only the explicit permitted actor in an ownerless group and rechecks access on capture', async () => {
+  const group = { sessionId: 's', larkAppId: 'cli_example', chatId: 'oc_chat', anchor: 'oc_chat',
+    ownerOpenId: '', active: true, scope: 'chat', chatType: 'group' };
+  expect(() => fixture({ session: () => group })).toThrow('session_unavailable');
+  for (const patch of [{ scope: 'thread' }, { chatType: 'p2p' }, { anchor: 'om_root' }]) {
+    expect(() => fixture({ session: () => ({ ...group, ...patch }) }, { actorOpenId: 'ou_owner' })).toThrow('session_unavailable');
+  }
+  let allowed = true;
+  const f = fixture({ session: () => group, canTalk: () => allowed }, { actorOpenId: 'ou_owner' });
+  expect(group.ownerOpenId).toBe('');
+  expect(f.binding.ownerOpenId).toBe('ou_owner');
+  const input = { ...f.event, anchor: 'oc_chat' };
+  expect(f.runtime.capture({ ...input, senderOpenId: 'ou_other' })).toBe(false);
+  expect(f.runtime.capture(input)).toBe(true);
+  expect(() => f.runtime.register('s', { pluginId: 'example', requestId: 'request', providerRef: 'opaque',
+    actorOpenId: 'ou_other' })).toThrow('identity_conflict');
+  allowed = false;
+  expect(() => f.runtime.capture({ ...input, messageId: 'om_revoked' })).toThrow('authority_changed');
+  expect(f.store.read().inputs).toHaveLength(1);
+  await f.runtime.drain();
+});
+it('keeps two actors on the same ownerless group anchor in separate input streams', async () => {
+  const group = { sessionId: 's', larkAppId: 'cli_example', chatId: 'oc_chat', anchor: 'oc_chat',
+    ownerOpenId: '', active: true, scope: 'chat', chatType: 'group' };
+  const f = fixture({ session: () => group }, { actorOpenId: 'ou_owner' });
+  const other = f.runtime.register('s', { pluginId: 'example', requestId: 'other', providerRef: 'opaque',
+    actorOpenId: 'ou_other' });
+  for (const actorOpenId of ['ou_owner', 'ou_other']) {
+    expect(() => f.runtime.register('s', { pluginId: 'example', requestId: `duplicate-${actorOpenId}`,
+      providerRef: 'opaque', actorOpenId })).toThrow('anchor_conflict');
+  }
+  const input = { ...f.event, anchor: 'oc_chat' };
+  expect(f.runtime.capture(input)).toBe(true);
+  expect(f.runtime.capture({ ...input, messageId: 'om_other', senderOpenId: 'ou_other' })).toBe(true);
+  expect(f.runtime.capture({ ...input, messageId: 'om_unbound', senderOpenId: 'ou_unbound' })).toBe(false);
+  await f.runtime.drain();
+  for (const [binding, messageId, actor] of [[f.binding, 'om_reply', 'ou_owner'], [other, 'om_other', 'ou_other']] as const) {
+    expect(f.runtime.inspect('s', binding.id)!.inputs).toEqual([
+      expect.objectContaining({ bindingId: binding.id, messageId, senderOpenId: actor, sequence: 1 }),
+    ]);
+  }
+  expect(group.ownerOpenId).toBe('');
+});
+it('an explicit actor cannot replace an owned topic principal', () => {
+  const f = fixture();
+  expect(() => f.runtime.register('s', { pluginId: 'example', requestId: 'other', providerRef: 'opaque',
+    actorOpenId: 'ou_other' })).toThrow('session_unavailable');
+  const args = ['register', '--bot', 'cli_example', '--session', 's', '--plugin', 'example', '--request', 'r', '--ref', 'opaque'];
+  expect(JSON.parse(parseInputCaptureCommand([...args, '--actor', 'ou_owner']).init.body)).toHaveProperty('actorOpenId', 'ou_owner');
+  expect(() => parseInputCaptureCommand([...args, '--actor', 'not_an_open_id'])).toThrow();
 });
