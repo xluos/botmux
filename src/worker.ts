@@ -20031,6 +20031,31 @@ async function spawnCli(
   let requestedAidenResumeRedraw = false;
   const releaseFirstPromptTimeout = (elapsedMs: number, forced: boolean): void => {
     if (!awaitingFirstPrompt || backend !== firstPromptBackend) return;
+    // Never let the timeout fallback paste the queued user turn into Codex's
+    // startup update picker. The picker can default to "Update now", so a
+    // pasted multiline prompt may accidentally submit a self-update. Keep the
+    // turn queued while the bounded Aiden recovery observes and selects Skip.
+    if (inspectAidenCodexUpdateDialogOnScreen()) {
+      log(`First prompt timeout — ${cliName()} update dialog still active; keeping input queued`);
+      const remainingMs = Math.max(0, FIRST_PROMPT_HARD_TIMEOUT_MS - elapsedMs);
+      if (remainingMs > 0) {
+        const waitMs = Math.min(FIRST_PROMPT_STARTUP_RECHECK_MS, remainingMs);
+        const nextElapsedMs = elapsedMs + waitMs;
+        const updateDialogTimer = setTimeout(
+          () => releaseFirstPromptTimeout(nextElapsedMs, nextElapsedMs >= FIRST_PROMPT_HARD_TIMEOUT_MS),
+          waitMs,
+        );
+        updateDialogTimer.unref?.();
+      } else if (!aidenCodexUpdateLimitNotified) {
+        aidenCodexUpdateLimitNotified = true;
+        send({
+          type: 'user_notify',
+          message: `${cliName()} 的升级菜单仍未自动跳过；消息已保留在队列中，尚未提交。请打开网页终端选择「2. Skip」。`,
+          turnId: currentBotmuxTurnId,
+        });
+      }
+      return;
+    }
     // A timeout can recover missing prompt evidence, never contradict explicit
     // loading evidence. Keep the queue/startup flag; the loaded frame re-drives
     // normal idle detection and flushes it without replaying a pasted draft.

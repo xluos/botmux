@@ -71,6 +71,7 @@ describe('startup update picker recovery', () => {
   it('submits only an observed safe selection', () => {
     expect(codexUpdatePickerKey(menu(1))).toBe('Down');
     expect(codexUpdatePickerKey(menu(2))).toBe('Enter');
+    expect(codexUpdatePickerKey(menu(1).replace('Press enter to continue', 'enter continue · esc skip'))).toBe('Down');
     expect(codexUpdatePickerKey(menu(1).replace('Press enter to continue', ''))).toBe('wait');
     expect(codexUpdatePickerKey(menu(1).replace('›', ' '))).toBe('wait');
     expect(codexUpdatePickerKey('› Ask Codex to do anything')).toBe('gone');
@@ -163,6 +164,20 @@ describe('Aiden Codex update dialog worker wiring', () => {
     expect(workerSource).toContain('const AIDEN_CODEX_UPDATE_MAX_ATTEMPTS = 3;');
     expect(dismiss).toContain("source === 'screen'");
     expect(dismiss).toContain("type: 'user_notify'");
+  });
+
+  it('keeps the first user turn queued while the update picker is visible', () => {
+    const start = workerSource.indexOf('const releaseFirstPromptTimeout =');
+    const end = workerSource.indexOf(
+      'setTimeout(() => releaseFirstPromptTimeout(FIRST_PROMPT_TIMEOUT_MS',
+      start,
+    );
+    const timeout = workerSource.slice(start, end);
+
+    expect(timeout).toContain('inspectAidenCodexUpdateDialogOnScreen()');
+    expect(timeout).toContain('update dialog still active; keeping input queued');
+    expect(timeout.indexOf('inspectAidenCodexUpdateDialogOnScreen()'))
+      .toBeLessThan(timeout.indexOf('awaitingFirstPrompt = false'));
   });
 });
 

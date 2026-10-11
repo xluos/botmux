@@ -64,7 +64,10 @@ export type CodexUpdatePickerKey = 'Down' | 'Enter' | 'wait' | 'gone';
 export function codexUpdatePickerKey(screen: string): CodexUpdatePickerKey {
   const plain = stripAnsiForLog(screen);
   if (!/Update available|Update now/i.test(plain)) return 'gone';
-  if (!/Press enter to continue/i.test(plain)) return 'wait';
+  // Codex <=0.162.0 rendered "Press enter to continue". 0.162.1 shortened
+  // the same ready hint to "enter continue · esc skip". Keep requiring a
+  // rendered submit hint so navigation never races a partially drawn picker.
+  if (!/(?:Press\s+enter\s+to\s+continue|\benter\b\s+continue\b)/i.test(plain)) return 'wait';
   const selected = plain.match(/^[ \t]*[›❯>][ \t]*\d+\.[ \t]*([^\r\n]+)/m)?.[1]?.trim();
   if (!selected) return 'wait';
   // Never submit the default upgrade row. Observe the safe selection first.
