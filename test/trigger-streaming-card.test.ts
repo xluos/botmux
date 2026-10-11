@@ -56,6 +56,15 @@ describe('handoff live card starts with committed input', () => {
     expect(commitTriggerStreamingCard(ds, 'next', start)).toBe(false);
     expect(ds.streamCardId).toBe('om_old');
   });
+  it('does not arm a live card for an API-only bot even with a real group id', () => {
+    const ds = session(), start = vi.fn();
+    armTriggerStreamingCard(ds, request(), 'next', true);
+    expect(hasPendingTriggerStreamingCard(ds, 'next')).toBe(false);
+    expect(commitTriggerStreamingCard(ds, 'next', start)).toBe(false);
+    expect(start).not.toHaveBeenCalled();
+    expect(ds.session.handoffLiveCard).toBeUndefined();
+    expect(ds.streamCardId).toBe('om_old');
+  });
   it('does not publish after the session closed', () => {
     const ds = session(), start = vi.fn(); armTriggerStreamingCard(ds, request(), 'next');
     ds.session.status = 'closed';

@@ -5,9 +5,11 @@
  * spinning up an HTTP server, registering bots, or mounting a full session map.
  */
 
-import type { AskOption, AskQuestion } from './ask-types.js';
+import type { ServerResponse } from 'node:http';
+import { registerAsk } from './ask-broker.js';
 import { parseOption, parseAskQuestions } from './ask-questions.js';
 export { parseAskQuestions } from './ask-questions.js';
+import type { CreateAskInput, AskResult, AskOption, AskQuestion } from './ask-types.js';
 
 export interface AskApiBody {
   sessionId: string;
@@ -25,10 +27,12 @@ export interface AskApiBody {
   /** Caller kind ('hook' | 'explicit' | …) namespacing the identity so an
    *  explicit `botmux ask` can't re-claim a hook ask's card. Optional. */
   originKind?: string;
+  acknowledge?: boolean;
 }
 
 export type AskApiBodyError =
   | 'bad_body'
+  | 'unsupported_fields'
   | 'bad_sessionId'
   | 'bad_chatId'
   | 'bad_larkAppId'
@@ -42,10 +46,12 @@ export type AskApiBodyError =
   | 'duplicate_option_key'
   | 'bad_questions'
   | 'bad_question_shape'
+  | 'bad_inputMode'
   | 'bad_multiSelect'
   | 'bad_defaultSelectedKeys'
   | 'bad_requestId'
-  | 'bad_originKind';
+  | 'bad_originKind'
+  | 'bad_acknowledge';
 
 /** Validate the request body. Returns either the parsed body or an error code
  *  ready to be sent back as `{ ok: false, error }` with HTTP 400.
@@ -88,6 +94,8 @@ export function parseAskBody(raw: unknown): AskApiBody | { error: AskApiBodyErro
     originKind = r.originKind;
   }
 
+  if (r.acknowledge !== undefined && typeof r.acknowledge !== 'boolean') return { error: 'bad_acknowledge' };
+
   let questions: AskQuestion[];
 
   if (Array.isArray(r.questions)) {
@@ -117,7 +125,7 @@ export function parseAskBody(raw: unknown): AskApiBody | { error: AskApiBodyErro
     return { error: 'bad_options' };
   }
 
-  return {
+  const parsed: AskApiBody = {
     sessionId: r.sessionId,
     chatId: r.chatId,
     larkAppId: r.larkAppId,
@@ -126,5 +134,31 @@ export function parseAskBody(raw: unknown): AskApiBody | { error: AskApiBodyErro
     timeoutMs: r.timeoutMs,
     ...(requestId !== undefined ? { requestId } : {}),
     ...(originKind !== undefined ? { originKind } : {}),
+    ...(r.acknowledge !== undefined ? { acknowledge: r.acknowledge as boolean } : {}),
   };
+  // Reject semantics this receiver did not parse instead of silently creating
+  // a different kind of Ask. Identity claims remain on the raw body for the
+  // route's authorization checks; options/prompt are normalized above.
+  const routeFields = new Set(['prompt', 'options', 'originCapability', 'originTurnId', 'originDispatchAttempt']);
+  if (Object.keys(r).some(key => r[key] !== undefined && !Object.hasOwn(parsed, key) && !routeFields.has(key))) {
+    return { error: 'unsupported_fields' };
+  }
+  return parsed;
+}
+
+/** The response, not IncomingMessage.close, tracks the long-poll lifetime:
+ * a fully read POST body may close while the client is still waiting. */
+export async function registerAskForResponse(
+  input: CreateAskInput,
+  res: ServerResponse,
+): Promise<AskResult> {
+  const controller = new AbortController();
+  const onClose = () => { controller.abort(); };
+  res.once('close', onClose);
+  if (res.destroyed) controller.abort();
+  try {
+    return await registerAsk(input, controller.signal);
+  } finally {
+    res.off('close', onClose);
+  }
 }

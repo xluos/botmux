@@ -551,7 +551,7 @@ describe('host — approve-dag（gate-2）', () => {
           { id: 'review', type: 'goal', bot: 'cli_review', goal: 'review', depends: ['develop'], inputs: [] },
         ],
       }));
-      const taskRoot = '/featspace/task-root';
+      const taskRoot = '/workspace/task-root';
       await cmdWorkflowHost('approve-dag', ['r', '--base-dir', b, '--working-dir', taskRoot], {
         loadBots: () => [
           { larkAppId: 'cli_dev', cliId: 'claude-code', workingDir: '/global/dev' } as any,
@@ -564,11 +564,32 @@ describe('host — approve-dag（gate-2）', () => {
         cli_dev: { workingDir: taskRoot },
         cli_review: { workingDir: taskRoot },
       });
+      const frozen = readFileSync(join(runDir, 'bots.snapshot.json'), 'utf-8');
+      await cmdWorkflowHost('approve-dag', ['r', '--base-dir', b, '--working-dir', '/later/path'], {
+        loadBots: () => { throw new Error('replay must not reload configuration'); },
+        resolveChatBinding: () => undefined,
+      });
+      expect(readFileSync(join(runDir, 'bots.snapshot.json'), 'utf-8')).toBe(frozen);
     } finally {
       log.mockRestore();
       rmSync(b, { recursive: true, force: true });
     }
   });
+
+  for (const tail of [[], [''], ['--another-option']]) {
+    it(`approve-dag rejects an empty working directory before publishing: ${JSON.stringify(tail)}`, async () => {
+      const b = base();
+      try {
+        const { runDir } = await toDagReady(b);
+        await expect(cmdWorkflowHost('approve-dag', ['r', '--base-dir', b, '--working-dir', ...tail], {
+          loadBots: () => { throw new Error('invalid argument must fail before config lookup'); },
+          resolveChatBinding: () => undefined,
+        })).rejects.toThrow('--working-dir requires a non-empty path');
+        expect(existsSync(join(runDir, 'run.json'))).toBe(false);
+        expect(readGrillState(runDir)!.status).toBe('dag_ready');
+      } finally { rmSync(b, { recursive: true, force: true }); }
+    });
+  }
 
   it('Gate-2 commit 后若崩在 dag_ready，所有改稿/重编排 fail-closed，replay 只完成 dag_approved transition', async () => {
     const b = base();

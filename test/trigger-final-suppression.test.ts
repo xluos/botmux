@@ -141,12 +141,12 @@ describe('internal task interrupted by ordinary IM input', () => {
       inheritActiveTurnFinalSuppression(ds, previous, next);
     });
     const caller = { requestUserOpenId: 'ou_owner', requestLarkAppId: 'cli_test', senderType: 'user' as const };
-    const internal = { turnId: 'trg_deployment', caller };
+    const internal = { turnId: 'trg_background', caller };
     armTriggerFinalSuppression(ds, internal.turnId);
     authority.reserve(internal);
     authority.markStarted(internal);
 
-    for (const turnId of ['om_build_retriggered', 'om_followup']) {
+    for (const turnId of ['om_updated_input', 'om_followup']) {
       const steer = { turnId, caller: mode === 'same-caller' ? caller : { ...caller, requestUserOpenId: 'ou_other' } };
       if (mode === 'cross-caller') authority.adoptEnvelopePreservingPrincipal(steer);
       else authority.reserve(steer);

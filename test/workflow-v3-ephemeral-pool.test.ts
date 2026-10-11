@@ -83,7 +83,37 @@ describe('v3WorkerBackendType', () => {
 });
 
 describe('v3 ephemeral pool', () => {
-  it('persists the explicit default instance and replays it into the workflow tmux worker after config changes', async () => {
+  it('freezes only strict names, filters worker inheritance and resolves this bot env without persisting credentials', async () => {
+    vi.stubEnv('UNLISTED_CLOUD_CREDENTIAL', 'host-sentinel');
+    vi.stubEnv('HTTPS_PROXY', 'proxy-sentinel');
+    try {
+      const bot: BotConfig = { larkAppId: 'cli_app', larkAppSecret: 'secret', cliId: 'codex',
+        envPolicy: { mode: 'strict', inherit: ['HTTPS_PROXY'] }, env: { MODEL_AUTH: 'bot-sentinel' } };
+      const frozen = botToSnapshot(bot, dir);
+      const serialized = JSON.stringify({ '': frozen });
+      expect(serialized.includes('bot-sentinel')).toBe(false);
+      const restored = parseFrozenBotSnapshots(JSON.parse(serialized)).get('')!;
+      bot.envPolicy = { mode: 'inherit' };
+      const worker = new ScriptedWorker(); const factory = factoryFor(worker);
+      const resolveBotEnv = vi.fn(appId => appId === bot.larkAppId ? bot.env : undefined);
+      const pool = createEphemeralPool({ factory, workerPath: '/tmp/worker.js', quiesceMs: 1,
+        resolveLarkAppSecret: () => 'secret', resolveBotEnv });
+      const running = pool.runNode({ ...request(), botSnapshot: restored });
+      await worker.waitForInit();
+      expect(worker.init.envPolicy).toEqual({ mode: 'strict', inherit: ['HTTPS_PROXY'] });
+      expect(worker.init.env.MODEL_AUTH === 'bot-sentinel').toBe(true);
+      expect(factory.lastOpts!.env.UNLISTED_CLOUD_CREDENTIAL).toBeUndefined();
+      expect(factory.lastOpts!.env.HTTPS_PROXY === 'proxy-sentinel').toBe(true);
+      expect(resolveBotEnv).toHaveBeenCalledWith('cli_app');
+      worker.emitMessage({ type: 'ready', port: 3001, token: 'tok' });
+      worker.emitMessage({ type: 'prompt_ready' });
+      worker.emitMessage({ type: 'final_output', content: 'done', lastUuid: 'u', turnId: 't' });
+      await waitFor(() => worker.kills.includes('SIGTERM')); worker.emitExit(0);
+      await expect(running).resolves.toMatchObject({ status: 'ok' });
+    } finally { vi.unstubAllEnvs(); }
+  });
+
+  it('persists the explicit default instance and replays it into the existing PTY worker after config changes', async () => {
     const home = join(dir, 'codex-a');
     mkdirSync(home, { mode: 0o700 });
     writeFileSync(join(home, 'config.toml'), 'cli_auth_credentials_store = "file"\n', { mode: 0o600 });
@@ -204,7 +234,7 @@ describe('v3 ephemeral pool', () => {
     const factory = factoryFor(worker);
     const req = request();
     req.botSnapshot.cliId = 'codex';
-    req.botSnapshot.wrapperCli = 'aiden x codex';
+    req.botSnapshot.wrapperCli = 'wrapper codex';
     const pool = createEphemeralPool({
       factory,
       workerPath: '/tmp/worker.js',
@@ -214,7 +244,7 @@ describe('v3 ephemeral pool', () => {
 
     const promise = pool.runNode(req);
     await worker.waitForInit();
-    expect(worker.init?.wrapperCli).toBe('aiden x codex');
+    expect(worker.init?.wrapperCli).toBe('wrapper codex');
     worker.emitExit(0);
     await promise;
   });

@@ -695,6 +695,9 @@ export async function cmdWorkflowHost(
       const runId = requireRunId(rest);
       const runDir = guardedRunDir(runId);
       const workingDirOverride = argValue(rest, '--working-dir');
+      if (rest.includes('--working-dir') && (!workingDirOverride?.trim() || workingDirOverride.startsWith('--'))) {
+        throw new Error('--working-dir requires a non-empty path');
+      }
       const now = new Date();
       // An already-published replay must not depend on today's bots.json just
       // to acknowledge the same Gate-2 decision. The in-lock reader remains

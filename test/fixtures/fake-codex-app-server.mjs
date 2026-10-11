@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 
+import { spawn } from 'node:child_process';
 import { appendFileSync, existsSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
@@ -27,6 +28,22 @@ const updatedAfter = Number(process.env.FAKE_CODEX_UPDATED_AFTER ?? '101');
 const finalText = process.env.FAKE_CODEX_FINAL_TEXT;
 const envLogPath = process.env.FAKE_CODEX_ENV_LOG;
 if (pidPath) writeFileSync(pidPath, String(process.pid));
+if (process.env.FAKE_CODEX_INHERITED_STDIO) {
+  // 后代持有 stdio，让父进程 exit 后仍无法触发 close。
+  spawn(process.execPath, ['-e', `
+    const { appendFileSync } = require('node:fs');
+    const log = entry => appendFileSync(process.argv[1], JSON.stringify(entry) + '\\n');
+    process.on('SIGUSR1', () => {
+      process.stdout.write(JSON.stringify({ id: 9001, method: 'stale/request' }) + '\\n',
+        () => log({ staleRequestSent: process.pid }));
+    });
+    log({ stdioHolderPid: process.pid });
+    setTimeout(() => {}, 60_000);
+  `, logPath], { stdio: 'inherit' });
+  if (process.env.FAKE_CODEX_INHERITED_STDIO === 'exit') {
+    process.on('SIGTERM', () => process.exit(0));
+  }
+}
 if (envLogPath) {
   const codexHome = process.env.CODEX_HOME ?? '';
   writeFileSync(envLogPath, JSON.stringify({
@@ -42,6 +59,7 @@ let currentThreadName;
 let goalTurn = null;
 let reconciledTurn = null;
 let activeTurn;
+let pendingUserInput;
 let steerCount = 0;
 /** For steer-group-mismatch: the clientIds actually sent (root + steers), so the
  *  fixture can emit a full-items terminal turn that OMITS one — exercising the
@@ -119,6 +137,23 @@ function completeTurn(request) {
       method: 'item/tool/call',
       params: { threadId, turnId, tool: 'forbidden-test-tool' },
     });
+  }
+  if (behavior.startsWith('user-input')) {
+    pendingUserInput = { threadId, turnId, requestId: behavior === 'user-input-string' ? 'native-question-1' : 9200 + turnAttempt };
+    const questions = [
+      { id: 'environment', header: 'Environment', question: 'Choose environment', isOther: true, isSecret: false,
+        options: [{ label: 'Staging (Recommended)', description: 'Test first' }, { label: 'Production', description: 'Live traffic' }] },
+      { id: 'notify', header: 'Notify', question: 'Choose channel', isOther: true, isSecret: false,
+        options: [{ label: 'Lark', description: 'In this chat' }, { label: 'Email', description: 'Send later' }] },
+    ];
+    if (behavior === 'user-input-unsupported') questions[1].options = [{ label: 'Only one' }];
+    if (behavior === 'user-input-text') questions[1].options = null;
+    write({ id: pendingUserInput.requestId, method: 'item/tool/requestUserInput', params: { threadId, turnId, questions } });
+    if (behavior === 'user-input-cancelled') {
+      setTimeout(() => { notify('turn/completed', { threadId, turn: { id: turnId, status: 'interrupted' } }); pendingUserInput = undefined; }, 200);
+    }
+    if (behavior === 'user-input-exit') setTimeout(() => process.exit(1), 200);
+    return;
   }
   if (behavior === 'hang-turn-completion') return;
   const finish = () => {
@@ -361,7 +396,25 @@ function emitTurnCompletion(threadId, turnId, outputSchema) {
 
 function handle(request) {
   if (logPath) appendFileSync(logPath, JSON.stringify(request) + '\n');
-  if (request.result !== undefined || request.error !== undefined) return;
+  if (request.result !== undefined || request.error !== undefined) {
+    if (behavior.startsWith('user-input') && pendingUserInput && request.id === pendingUserInput.requestId) {
+      const { threadId, turnId } = pendingUserInput;
+      pendingUserInput = undefined;
+      notify('item/completed', { threadId, turnId, item: {
+        id: 'message-user-input', type: 'agentMessage', phase: 'final_answer', text: `Answered: ${JSON.stringify(request.result)}`,
+      } });
+      notify('turn/completed', { threadId, turn: { id: turnId, status: 'completed' } });
+    }
+    return;
+  }
+  if (request.method === 'turn/interrupt' && behavior.startsWith('user-input')) {
+    if (behavior === 'user-input-interrupt-error') { reject(request.id, -32000, 'interrupt failed'); return; }
+    const pending = pendingUserInput;
+    pendingUserInput = undefined;
+    respond(request.id, {});
+    if (pending) notify('turn/completed', { threadId: pending.threadId, turn: { id: pending.turnId, status: 'interrupted' } });
+    return;
+  }
   if (typeof request.id !== 'number') return;
 
   if (request.method === 'initialize') {

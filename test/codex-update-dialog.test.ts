@@ -4,7 +4,7 @@ import { isObserveBackend } from '../src/adapters/backend/types.js';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
-import { CodexUpdateDialogGuard, codexUpdateDialogSafeKeys, codexUpdatePickerKey, dismissCodexUpdatePicker } from '../src/utils/codex-update-dialog.js';
+import { aidenCodexResumeNeedsRedraw, CodexUpdateDialogGuard, codexUpdateDialogSafeKeys, codexUpdatePickerKey, dismissCodexUpdatePicker } from '../src/utils/codex-update-dialog.js';
 
 describe('CodexUpdateDialogGuard', () => {
   it('detects the numbered Update now / Skip picker through ANSI', () => {
@@ -179,4 +179,18 @@ it.each([false, true, undefined])('counts only a recovery with accepted input (%
   const code = worker.slice(start, end).replace('(target as any)', 'target');
   const run = new Function('target', 'key', 'let delivered = false; let aidenCodexUpdateAttempts = 0; ' + code + 'return aidenCodexUpdateAttempts;');
   expect(run({ sendSpecialKeys: () => result }, 'Enter')).toBe(result === false ? 0 : 1);
+});
+const workerSourceForDelivery = readFileSync(join(process.cwd(), 'src/worker.ts'), 'utf8');
+
+describe('Aiden resumed composer redraw', () => {
+  it('requests a redraw only for an empty resumed composer with the configured runtime footer', () => {
+    const screen = 'Previous answer\n\n› Ask Codex to do anything\n\n  gpt-5.6-sol high · /tmp/project · Task title\n';
+    expect(aidenCodexResumeNeedsRedraw(screen)).toBe(true);
+    for (const prefix of ['│ model: loading │\n', 'Resuming session...\n', 'Working (esc to interrupt)\n', 'Queued for capacity\n']) {
+      expect(aidenCodexResumeNeedsRedraw(prefix + screen)).toBe(false);
+    }
+    expect(aidenCodexResumeNeedsRedraw(screen.replace('Ask Codex to do anything', 'unsent draft'))).toBe(false);
+    expect(aidenCodexResumeNeedsRedraw(screen + 'Press enter to continue')).toBe(false);
+    expect(aidenCodexResumeNeedsRedraw('› Ask Codex to do anything\n  ? for shortcuts')).toBe(false);
+  });
 });
