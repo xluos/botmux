@@ -8200,6 +8200,7 @@ import {
   containsLarkAtTag,
   matchUniqueChatMemberOpenId,
 } from './services/send-policy.js';
+import { normalizePositionalSendContent } from './services/send-content.js';
 
 /**
  * Sandbox relay mode for `botmux send`. Inside a file-sandbox the CLI cannot
@@ -8268,7 +8269,9 @@ async function relaySend(
     // bare message instead of the original loud "no content" failure. Plumbing
     // `--attention` through the relay is a separate change, out of this scope.
     const pos = positionals(rest, ['--card', '--text', '--top-level', '--no-quote', '--mention-back', '--no-mention', '--anyway', '--voice', '--slash', '--urgent']);
-    content = pos.length > 0 ? pos.join(' ') : await readStdin();
+    content = pos.length > 0
+      ? normalizePositionalSendContent(pos.join(' '))
+      : await readStdin();
   }
   content = stripTrailingOaiMemoryCitation(content);
   const preparedCardContent = cardJsonArg === undefined && cardFile === undefined && !rest.includes('--voice')
@@ -9668,7 +9671,7 @@ async function cmdSend(rest: string[]): Promise<void> {
   } else {
     const pos = positionals(rest, ['--card', '--text', '--top-level', '--no-quote', '--mention-back', '--no-mention', '--anyway', '--voice', '--attention', '--urgent', '--slash']);
     if (pos.length > 0) {
-      content = pos.join(' ');
+      content = normalizePositionalSendContent(pos.join(' '));
     } else {
       content = await readStdin();
     }
