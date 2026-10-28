@@ -2,7 +2,11 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
-import type { SessionLease } from '../src/services/durable-coordination.js';
+import {
+  DURABLE_INBOX_LANE_LARK_MESSAGE,
+  DURABLE_INBOX_LANE_SESSION_CONTROL,
+  type SessionLease,
+} from '../src/services/durable-coordination.js';
 import { SqliteDurableCoordinationStore } from '../src/services/sqlite-durable-coordination.js';
 import { openDatabaseSyncOrThrow } from '../src/services/sqlite-compat.js';
 
@@ -70,6 +74,47 @@ describe('SQLite durable coordination contract', () => {
     await store.close();
   });
 
+  it('lists canonical Sessions in stable key order with a bounded cursor', async () => {
+    const store = makeStore(() => 100);
+    for (const key of ['session-c', 'session-a', 'session-b']) {
+      const lease = acquired(await store.acquireSessionLease({
+        sessionKey: key,
+        ownerId: 'worker-a',
+        leaseDurationMs: 50,
+      }));
+      await store.writeSession({ lease, expectedRevision: null, value: { key } });
+    }
+
+    const first = await store.listSessions({ limit: 2 });
+    expect(first.records.map(row => row.sessionKey)).toEqual(['session-a', 'session-b']);
+    expect(first.nextSessionKey).toBe('session-b');
+    const second = await store.listSessions({ afterSessionKey: first.nextSessionKey, limit: 2 });
+    expect(second.records.map(row => row.sessionKey)).toEqual(['session-c']);
+    expect(second.nextSessionKey).toBeUndefined();
+    await expect(store.listSessions({ limit: 0 })).rejects.toThrow(/between 1 and 1000/);
+    await store.close();
+  });
+
+  it('keeps auxiliary state outside the canonical Session list', async () => {
+    const store = makeStore(() => 10);
+    const lease = acquired(await store.acquireSessionLease({
+      sessionKey: 'auxiliary::recalls::chat-a', ownerId: 'worker-a', leaseDurationMs: 10,
+    }));
+    await expect(store.writeAuxiliaryState({
+      lease, expectedRevision: null, value: { type: 'recalls', ids: ['om_1'] },
+    })).resolves.toMatchObject({
+      kind: 'written',
+      record: { stateKey: 'auxiliary::recalls::chat-a', revision: 1 },
+    });
+    await expect(store.readAuxiliaryState('auxiliary::recalls::chat-a')).resolves.toMatchObject({
+      stateKey: 'auxiliary::recalls::chat-a',
+      revision: 1,
+      value: { type: 'recalls', ids: ['om_1'] },
+    });
+    await expect(store.listSessions({ limit: 10 })).resolves.toEqual({ records: [] });
+    await store.close();
+  });
+
   it('rejects stale lease renewal and both Session CAS mismatch legs', async () => {
     let now = 1;
     const store = makeStore(() => now);
@@ -115,6 +160,10 @@ describe('SQLite durable coordination contract', () => {
     expect(await store.enqueueInbox({
       eventId: 'event-1', partitionKey: 'chat-a', payload: { a: 9 }, visibleAt: 0, createdAt: 1,
     })).toEqual({ kind: 'conflict' });
+    expect(await store.enqueueInbox({
+      eventId: 'event-1', lane: DURABLE_INBOX_LANE_SESSION_CONTROL,
+      partitionKey: 'chat-a', payload: { b: 2, a: 1 }, visibleAt: 0, createdAt: 1,
+    })).toEqual({ kind: 'conflict' });
     await store.enqueueInbox({
       eventId: 'event-2', partitionKey: 'chat-a', payload: { n: 2 }, visibleAt: 0, createdAt: 2,
     });
@@ -143,6 +192,335 @@ describe('SQLite durable coordination contract', () => {
     await store.close();
   });
 
+  it('deduplicates realtime and REST snapshots of one Lark receive event by immutable identity', async () => {
+    const store = makeStore(() => 10);
+    const eventId = 'im.message.receive_v1:cli_test:om_same';
+    const partitionKey = 'lark-message-routing:cli_test:oc_chat';
+    expect(await store.enqueueInbox({
+      eventId,
+      partitionKey,
+      payload: {
+        version: 1,
+        type: 'lark.im.message.receive_v1',
+        larkAppId: 'cli_test',
+        event: {
+          message: {
+            message_id: 'om_same', chat_id: 'oc_chat', chat_type: 'group',
+            message_type: 'text', content: '{"text":"same"}', create_time: '1',
+          },
+          sender: { sender_id: { open_id: 'ou_user', union_id: 'on_user' } },
+        },
+      },
+      visibleAt: 10,
+      createdAt: 10,
+    })).toEqual({ kind: 'inserted' });
+    expect(await store.enqueueInbox({
+      eventId,
+      partitionKey,
+      payload: {
+        version: 1,
+        type: 'lark.im.message.receive_v1',
+        larkAppId: 'cli_test',
+        event: {
+          message: {
+            message_id: 'om_same', chat_id: 'oc_chat', chat_type: 'group',
+            msg_type: 'text', body: { content: '{"text":"same"}' }, create_time: '1',
+          },
+          sender: { sender_id: { open_id: 'ou_user' } },
+        },
+      },
+      visibleAt: 11,
+      createdAt: 11,
+    })).toEqual({ kind: 'duplicate' });
+    for (const changed of [
+      { message: { chat_id: 'oc_other' } },
+      { message: { content: '{"text":"/restart"}' } },
+      { sender: { sender_id: { open_id: 'ou_other' } } },
+      { sender: { sender_id: { open_id: 'ou_user', union_id: 'on_other' } } },
+    ]) {
+      const message = {
+        message_id: 'om_same', chat_id: 'oc_chat', chat_type: 'group',
+        message_type: 'text', content: '{"text":"same"}', create_time: '1',
+        ...(changed.message ?? {}),
+      };
+      expect(await store.enqueueInbox({
+        eventId,
+        partitionKey,
+        payload: {
+          version: 1,
+          type: 'lark.im.message.receive_v1',
+          larkAppId: 'cli_test',
+          event: {
+            message,
+            sender: changed.sender ?? { sender_id: { open_id: 'ou_user' } },
+          },
+        },
+        visibleAt: 11,
+        createdAt: 11,
+      })).toEqual({ kind: 'conflict' });
+    }
+    expect(await store.enqueueInbox({
+      eventId,
+      partitionKey,
+      payload: {
+        version: 1,
+        type: 'lark.im.message.receive_v1',
+        larkAppId: 'cli_test',
+        event: {
+          event: {
+            message: {
+              message_id: 'om_same', chat_id: 'oc_chat', chat_type: 'group',
+              message_type: 'text', content: '{"text":"same"}', create_time: '1',
+            },
+            sender: { sender_id: { open_id: 'ou_nested_other' } },
+          },
+        },
+      },
+      visibleAt: 11,
+      createdAt: 11,
+    })).toEqual({ kind: 'conflict' });
+
+    const mentionedEventId = 'im.message.receive_v1:cli_test:om_mentioned';
+    const mentioned = {
+      version: 1,
+      type: 'lark.im.message.receive_v1',
+      larkAppId: 'cli_test',
+      event: {
+        message: {
+          message_id: 'om_mentioned', chat_id: 'oc_chat', chat_type: 'group',
+          message_type: 'text', content: '{"text":"@user hi"}', create_time: '2',
+          mentions: [{ key: '@_user_1', name: 'User', id: { open_id: 'ou_mentioned', union_id: 'on_a' } }],
+        },
+        sender: { sender_id: { open_id: 'ou_user' } },
+      },
+    } as const;
+    expect(await store.enqueueInbox({
+      eventId: mentionedEventId,
+      partitionKey,
+      payload: mentioned,
+      visibleAt: 12,
+      createdAt: 12,
+    })).toEqual({ kind: 'inserted' });
+    expect(await store.enqueueInbox({
+      eventId: mentionedEventId,
+      partitionKey,
+      payload: {
+        ...mentioned,
+        event: {
+          ...mentioned.event,
+          message: {
+            ...mentioned.event.message,
+            mentions: [{ key: '@_user_1', name: 'User', id: { open_id: 'ou_mentioned', union_id: 'on_b' } }],
+          },
+        },
+      },
+      visibleAt: 13,
+      createdAt: 13,
+    })).toEqual({ kind: 'conflict' });
+    expect(await store.enqueueInbox({
+      eventId: mentionedEventId,
+      partitionKey,
+      payload: {
+        ...mentioned,
+        event: {
+          ...mentioned.event,
+          message: {
+            ...mentioned.event.message,
+            mentions: [{ key: '@_user_1', name: 'Renamed User', id: { open_id: 'ou_mentioned', union_id: 'on_a' } }],
+          },
+        },
+      },
+      visibleAt: 13,
+      createdAt: 13,
+    })).toEqual({ kind: 'duplicate' });
+    const cardEventId = 'im.message.receive_v1:cli_test:om_card';
+    const card = {
+      ...mentioned,
+      event: {
+        ...mentioned.event,
+        message: {
+          ...mentioned.event.message,
+          message_id: 'om_card',
+          message_type: 'interactive',
+          content: '{"title":null,"elements":[[{"tag":"text","text":"请升级至最新版本客户端，以查看内容"}]]}',
+        },
+      },
+    };
+    expect(await store.enqueueInbox({
+      eventId: cardEventId,
+      partitionKey,
+      payload: card,
+      visibleAt: 14,
+      createdAt: 14,
+    })).toEqual({ kind: 'inserted' });
+    expect(await store.enqueueInbox({
+      eventId: cardEventId,
+      partitionKey,
+      payload: {
+        ...card,
+        event: {
+          ...card.event,
+          message: {
+            ...card.event.message,
+            content: '{"schema":"2.0","body":{"elements":[{"tag":"markdown","content":"same card"}]}}',
+          },
+        },
+      },
+      visibleAt: 15,
+      createdAt: 15,
+    })).toEqual({ kind: 'duplicate' });
+    const fullCardEventId = 'im.message.receive_v1:cli_test:om_full_card';
+    const fullCard = {
+      ...card,
+      event: {
+        ...card.event,
+        message: {
+          ...card.event.message,
+          message_id: 'om_full_card',
+          content: '{"schema":"2.0","body":{"elements":[{"tag":"markdown","content":"first"}]}}',
+        },
+      },
+    };
+    expect(await store.enqueueInbox({
+      eventId: fullCardEventId,
+      partitionKey,
+      payload: fullCard,
+      visibleAt: 16,
+      createdAt: 16,
+    })).toEqual({ kind: 'inserted' });
+    expect(await store.enqueueInbox({
+      eventId: fullCardEventId,
+      partitionKey,
+      payload: {
+        ...fullCard,
+        event: {
+          ...fullCard.event,
+          message: {
+            ...fullCard.event.message,
+            content: '{"schema":"2.0","body":{"elements":[{"tag":"markdown","content":"changed"}]}}',
+          },
+        },
+      },
+      visibleAt: 17,
+      createdAt: 17,
+    })).toEqual({ kind: 'conflict' });
+    expect(await store.enqueueInbox({
+      eventId,
+      partitionKey,
+      payload: {
+        version: 1,
+        type: 'lark.im.message.receive_v1',
+        larkAppId: 'cli_test',
+        event: { message: { message_id: 'om_other', chat_id: 'oc_chat' } },
+      },
+      visibleAt: 12,
+      createdAt: 12,
+    })).toEqual({ kind: 'conflict' });
+    await store.close();
+  });
+
+  it('atomically fences inbox insertion with the current ingress lease', async () => {
+    let now = 10;
+    const store = makeStore(() => now);
+    const lease = acquired(await store.acquireSessionLease({
+      sessionKey: 'botmux.ingress:lark:cli_test',
+      ownerId: 'ingress-a',
+      leaseDurationMs: 10,
+    }));
+    const event = {
+      eventId: 'im.message.receive_v1:cli_test:om_fenced',
+      partitionKey: 'lark-message-routing:cli_test:oc_chat',
+      payload: {
+        version: 1,
+        type: 'lark.im.message.receive_v1',
+        larkAppId: 'cli_test',
+        event: { message: { message_id: 'om_fenced', chat_id: 'oc_chat' } },
+      },
+      visibleAt: 10,
+      createdAt: 10,
+    } as const;
+
+    await expect(store.enqueueInboxWithLease({ lease, event }))
+      .resolves.toEqual({ kind: 'inserted' });
+    now = 20;
+    await expect(store.enqueueInboxWithLease({ lease, event: { ...event, eventId: 'event-late' } }))
+      .resolves.toEqual({ kind: 'stale_lease' });
+    expect(await store.claimNextInbox({ workerId: 'worker', leaseDurationMs: 10 }))
+      .toMatchObject({ event: { eventId: event.eventId } });
+    await store.close();
+  });
+
+  it('isolates inbox lanes and lets an owner claim only its local partitions', async () => {
+    const store = makeStore(() => 10);
+    await store.enqueueInbox({
+      eventId: 'control-a', lane: DURABLE_INBOX_LANE_SESSION_CONTROL,
+      partitionKey: 'session-a', payload: { action: 'close' }, visibleAt: 0, createdAt: 1,
+    });
+    await store.enqueueInbox({
+      eventId: 'message-a', lane: DURABLE_INBOX_LANE_LARK_MESSAGE,
+      partitionKey: 'session-a', payload: { type: 'message' }, visibleAt: 0, createdAt: 2,
+    });
+    await store.enqueueInbox({
+      eventId: 'control-b', lane: DURABLE_INBOX_LANE_SESSION_CONTROL,
+      partitionKey: 'session-b', payload: { action: 'resume' }, visibleAt: 0, createdAt: 3,
+    });
+
+    expect(await store.claimNextInbox({
+      workerId: 'control-none', lane: DURABLE_INBOX_LANE_SESSION_CONTROL,
+      partitionKeys: [], leaseDurationMs: 20,
+    })).toBeUndefined();
+    const message = await store.claimNextInbox({
+      workerId: 'message-worker', lane: DURABLE_INBOX_LANE_LARK_MESSAGE,
+      leaseDurationMs: 20,
+    });
+    expect(message).toMatchObject({
+      event: { eventId: 'message-a', lane: DURABLE_INBOX_LANE_LARK_MESSAGE },
+    });
+    const controlB = await store.claimNextInbox({
+      workerId: 'owner-b', lane: DURABLE_INBOX_LANE_SESSION_CONTROL,
+      partitionKeys: ['session-b'], leaseDurationMs: 20,
+    });
+    expect(controlB).toMatchObject({
+      event: { eventId: 'control-b', lane: DURABLE_INBOX_LANE_SESSION_CONTROL },
+    });
+    const controlA = await store.claimNextInbox({
+      workerId: 'owner-a', lane: DURABLE_INBOX_LANE_SESSION_CONTROL,
+      partitionKeys: ['session-a', 'session-a'], leaseDurationMs: 20,
+    });
+    expect(controlA).toMatchObject({
+      event: { eventId: 'control-a', lane: DURABLE_INBOX_LANE_SESSION_CONTROL },
+    });
+    await store.close();
+  });
+
+  it('claims inbox partitions by literal prefix without treating underscores as wildcards', async () => {
+    const store = makeStore(() => 10);
+    await store.enqueueInbox({
+      eventId: 'prefix-other', lane: DURABLE_INBOX_LANE_SESSION_CONTROL,
+      partitionKey: 'lark-session-control:cliXtest:remote', payload: {}, visibleAt: 0, createdAt: 1,
+    });
+    await store.enqueueInbox({
+      eventId: 'prefix-match', lane: DURABLE_INBOX_LANE_SESSION_CONTROL,
+      partitionKey: 'lark-session-control:cli_test:local', payload: {}, visibleAt: 0, createdAt: 2,
+    });
+
+    const claim = await store.claimNextInbox({
+      workerId: 'prefix-worker',
+      lane: DURABLE_INBOX_LANE_SESSION_CONTROL,
+      partitionKeyPrefix: 'lark-session-control:cli_test:',
+      leaseDurationMs: 20,
+    });
+    expect(claim?.event.eventId).toBe('prefix-match');
+    await expect(store.claimNextInbox({
+      workerId: 'invalid-filter',
+      lane: DURABLE_INBOX_LANE_SESSION_CONTROL,
+      partitionKeys: ['lark-session-control:cli_test:local'],
+      partitionKeyPrefix: 'lark-session-control:cli_test:',
+      leaseDurationMs: 20,
+    })).rejects.toThrow('mutually exclusive');
+    await store.close();
+  });
+
   it('orders one partition by store insertion sequence instead of client timestamps or ids', async () => {
     let now = 10;
     const store = makeStore(() => now);
@@ -165,7 +543,7 @@ describe('SQLite durable coordination contract', () => {
     await store.close();
   });
 
-  it('backfills deterministic inbox and outbox sequence rows when reopening a version-1 store', async () => {
+  it('backfills deterministic inbox and outbox sequence rows when order tables are missing', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'botmux-durable-sequence-migration-'));
     tempDirs.push(dir);
     const path = join(dir, 'coordination.db');
@@ -204,6 +582,100 @@ describe('SQLite durable coordination contract', () => {
     expect(claim?.event.eventId).toBe('legacy-a');
     const reservation = await reopened.reserveNextOutbox({ workerId: 'sender-a', leaseDurationMs: 20 });
     expect(reservation?.record.messageId).toBe('legacy-outbox-a');
+    await reopened.close();
+  });
+
+  it('upgrades version 1 inbox rows into the default Lark message lane', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-durable-lane-migration-'));
+    tempDirs.push(dir);
+    const path = join(dir, 'coordination.db');
+    const first = new SqliteDurableCoordinationStore(path, { now: () => 10 });
+    await first.enqueueInbox({
+      eventId: 'legacy-message', partitionKey: 'chat-a', payload: {}, visibleAt: 0, createdAt: 1,
+    });
+    await first.close();
+
+    const raw = openDatabaseSyncOrThrow(path);
+    raw.exec('DROP INDEX durable_inbox_lane_claim_idx;');
+    raw.exec('DROP INDEX durable_inbox_lane_partition_claim_idx;');
+    raw.exec('ALTER TABLE durable_inbox DROP COLUMN lane;');
+    raw.prepare(
+      'UPDATE durable_coordination_meta SET schema_version = 1 WHERE singleton = 1',
+    ).run();
+    raw.close();
+
+    const reopened = new SqliteDurableCoordinationStore(path, { now: () => 10 });
+    const claim = await reopened.claimNextInbox({
+      workerId: 'message-worker',
+      lane: DURABLE_INBOX_LANE_LARK_MESSAGE,
+      leaseDurationMs: 20,
+    });
+    expect(claim).toMatchObject({
+      event: { eventId: 'legacy-message', lane: DURABLE_INBOX_LANE_LARK_MESSAGE },
+    });
+    await reopened.close();
+  });
+
+  it('upgrades version 2 stores with control operations and auxiliary state', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-durable-control-migration-'));
+    tempDirs.push(dir);
+    const path = join(dir, 'coordination.db');
+    const first = new SqliteDurableCoordinationStore(path, { now: () => 10 });
+    await first.close();
+
+    const raw = openDatabaseSyncOrThrow(path);
+    raw.exec('DROP TABLE durable_control_operations;');
+    raw.prepare(
+      'UPDATE durable_coordination_meta SET schema_version = 2 WHERE singleton = 1',
+    ).run();
+    raw.close();
+
+    const reopened = new SqliteDurableCoordinationStore(path, { now: () => 11 });
+    const lease = acquired(await reopened.acquireSessionLease({
+      sessionKey: 'session-migrated', ownerId: 'worker-a', leaseDurationMs: 100,
+    }));
+    expect(await reopened.enqueueControlOperation({
+      lease,
+      operation: {
+        operationId: 'control-migrated',
+        sessionKey: 'session-migrated',
+        payload: { action: 'close' },
+        createdAt: 11,
+      },
+    })).toEqual({ kind: 'inserted' });
+    expect(await reopened.readControlOperation('control-migrated')).toMatchObject({
+      state: 'pending', attempts: 0,
+    });
+    await reopened.close();
+
+    const migrated = openDatabaseSyncOrThrow(path);
+    expect(migrated.prepare(
+      'SELECT schema_version FROM durable_coordination_meta WHERE singleton = 1',
+    ).get()).toEqual({ schema_version: 4 });
+    migrated.close();
+  });
+
+  it('upgrades version 3 stores with the auxiliary state table', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-durable-auxiliary-migration-'));
+    tempDirs.push(dir);
+    const path = join(dir, 'coordination.db');
+    const first = new SqliteDurableCoordinationStore(path, { now: () => 10 });
+    await first.close();
+
+    const raw = openDatabaseSyncOrThrow(path);
+    raw.exec('DROP TABLE durable_auxiliary_state;');
+    raw.prepare(
+      'UPDATE durable_coordination_meta SET schema_version = 3 WHERE singleton = 1',
+    ).run();
+    raw.close();
+
+    const reopened = new SqliteDurableCoordinationStore(path, { now: () => 11 });
+    const lease = acquired(await reopened.acquireSessionLease({
+      sessionKey: 'auxiliary::migrated', ownerId: 'worker-a', leaseDurationMs: 100,
+    }));
+    await expect(reopened.writeAuxiliaryState({
+      lease, expectedRevision: null, value: { migrated: true },
+    })).resolves.toMatchObject({ kind: 'written', record: { revision: 1 } });
     await reopened.close();
   });
 
@@ -478,6 +950,312 @@ describe('SQLite durable coordination contract', () => {
     expect(await store.completeOutboxAttempt({
       attempt: nextAttempt.attempt, receipt: { platformMessageId: 'om_delayed' },
     })).toMatchObject({ kind: 'applied', record: { state: 'delivered' } });
+    await store.close();
+  });
+
+  it('deduplicates stable control operation ids and only retries proven pre-effect failures', async () => {
+    let now = 1;
+    const store = makeStore(() => now);
+    const lease = acquired(await store.acquireSessionLease({
+      sessionKey: 'session-control', ownerId: 'worker-a', leaseDurationMs: 100,
+    }));
+    const operation = {
+      operationId: 'control:event-1',
+      sessionKey: 'session-control',
+      payload: { action: 'close', expectedGeneration: 3 },
+      createdAt: 1,
+    } as const;
+    await expect(store.enqueueControlOperation({
+      lease,
+      operation: { ...operation, sessionKey: 'session-other' },
+    })).rejects.toThrow(/sessionKey must match the fencing lease/);
+    expect(await store.enqueueControlOperation({ lease, operation })).toEqual({ kind: 'inserted' });
+    expect(await store.enqueueControlOperation({
+      lease, operation: { ...operation, createdAt: 99 },
+    })).toEqual({ kind: 'duplicate' });
+    expect(await store.enqueueControlOperation({
+      lease, operation: { ...operation, payload: { action: 'resume' } },
+    })).toEqual({ kind: 'conflict' });
+
+    now = 2;
+    const first = await store.beginControlOperationAttempt({
+      lease, operationId: operation.operationId,
+    });
+    expect(first).toMatchObject({
+      kind: 'applied',
+      record: { state: 'attempting', attempts: 1, originEpoch: 1 },
+      attempt: { ownerId: 'worker-a', leaseEpoch: 1, attempt: 1 },
+    });
+    if (first.kind !== 'applied') throw new Error('expected first control attempt');
+    expect(await store.completeControlOperationAttempt({
+      attempt: { ...first.attempt, sessionKey: 'session-other' },
+      result: { closed: true },
+    })).toEqual({ kind: 'stale' });
+    now = 3;
+    expect(await store.retryControlOperationAttempt({
+      attempt: first.attempt,
+      error: 'provider rejected before dispatch',
+    })).toMatchObject({
+      kind: 'applied', record: { state: 'pending', attempts: 1 },
+    });
+    expect(await store.completeControlOperationAttempt({
+      attempt: first.attempt, result: { closed: true },
+    })).toEqual({ kind: 'stale' });
+
+    now = 4;
+    const second = await store.beginControlOperationAttempt({
+      lease, operationId: operation.operationId,
+    });
+    expect(second).toMatchObject({
+      kind: 'applied', record: { state: 'attempting', attempts: 2 },
+    });
+    if (second.kind !== 'applied') throw new Error('expected second control attempt');
+    expect(await store.markControlOperationAmbiguous({
+      attempt: first.attempt,
+      error: 'old attempt must not mutate the new attempt',
+    })).toEqual({ kind: 'stale' });
+    now = 5;
+    expect(await store.completeControlOperationAttempt({
+      attempt: second.attempt,
+      result: { status: 'closed', remoteGeneration: 3 },
+    })).toMatchObject({
+      kind: 'applied',
+      record: {
+        state: 'completed',
+        attempts: 2,
+        result: { status: 'closed', remoteGeneration: 3 },
+      },
+    });
+    expect(await store.beginControlOperationAttempt({
+      lease, operationId: operation.operationId,
+    })).toMatchObject({ kind: 'not_pending', record: { state: 'completed' } });
+    await store.close();
+  });
+
+  it('rejects stale begin tokens and freezes the same owner after its lease epoch changes', async () => {
+    let now = 1;
+    const store = makeStore(() => now);
+    const firstLease = acquired(await store.acquireSessionLease({
+      sessionKey: 'session-same-owner', ownerId: 'worker-a', leaseDurationMs: 10,
+    }));
+    await store.enqueueControlOperation({
+      lease: firstLease,
+      operation: {
+        operationId: 'control:pending-stale-lease',
+        sessionKey: 'session-same-owner',
+        payload: { action: 'close' },
+        createdAt: 1,
+      },
+    });
+    await store.enqueueControlOperation({
+      lease: firstLease,
+      operation: {
+        operationId: 'control:same-owner-new-epoch',
+        sessionKey: 'session-same-owner',
+        payload: { action: 'resume' },
+        createdAt: 1,
+      },
+    });
+    expect(await store.beginControlOperationAttempt({
+      lease: firstLease,
+      operationId: 'control:same-owner-new-epoch',
+    })).toMatchObject({ kind: 'applied', attempt: { leaseEpoch: 1 } });
+
+    now = 11;
+    const takeover = acquired(await store.acquireSessionLease({
+      sessionKey: 'session-same-owner', ownerId: 'worker-a', leaseDurationMs: 100,
+    }));
+    expect(takeover.epoch).toBe(2);
+    expect(await store.beginControlOperationAttempt({
+      lease: firstLease,
+      operationId: 'control:pending-stale-lease',
+    })).toEqual({ kind: 'stale_lease' });
+    expect(await store.beginControlOperationAttempt({
+      lease: takeover,
+      operationId: 'control:same-owner-new-epoch',
+    })).toMatchObject({
+      kind: 'not_pending',
+      record: {
+        state: 'ambiguous',
+        attempts: 1,
+        lastError: 'control attempt lost its session lease before result',
+      },
+    });
+    await store.close();
+  });
+
+  it('freezes an attempting control operation on lease takeover but accepts its exact late result', async () => {
+    let now = 1;
+    const store = makeStore(() => now);
+    const firstLease = acquired(await store.acquireSessionLease({
+      sessionKey: 'session-takeover', ownerId: 'worker-a', leaseDurationMs: 10,
+    }));
+    await store.enqueueControlOperation({
+      lease: firstLease,
+      operation: {
+        operationId: 'control:takeover',
+        sessionKey: 'session-takeover',
+        payload: { action: 'resume' },
+        createdAt: 1,
+      },
+    });
+    const begun = await store.beginControlOperationAttempt({
+      lease: firstLease, operationId: 'control:takeover',
+    });
+    if (begun.kind !== 'applied') throw new Error('expected begun control attempt');
+
+    now = 11;
+    const takeover = acquired(await store.acquireSessionLease({
+      sessionKey: 'session-takeover', ownerId: 'worker-b', leaseDurationMs: 100,
+    }));
+    expect(takeover.epoch).toBe(2);
+    expect(await store.beginControlOperationAttempt({
+      lease: takeover, operationId: 'control:takeover',
+    })).toMatchObject({
+      kind: 'not_pending',
+      record: {
+        state: 'ambiguous',
+        attempts: 1,
+        lastError: 'control attempt lost its session lease before result',
+      },
+    });
+    expect(await store.retryControlOperationAttempt({
+      attempt: begun.attempt, error: 'must not replay result-unknown work',
+    })).toEqual({ kind: 'stale' });
+
+    now = 12;
+    expect(await store.completeControlOperationAttempt({
+      attempt: begun.attempt,
+      result: { status: 'resumed', generation: 4 },
+    })).toMatchObject({
+      kind: 'applied',
+      record: { state: 'completed', result: { status: 'resumed', generation: 4 } },
+    });
+    await store.close();
+  });
+
+  it('leaves ambiguous control work closed until backend reconciliation proves the outcome', async () => {
+    let now = 1;
+    const store = makeStore(() => now);
+    const firstLease = acquired(await store.acquireSessionLease({
+      sessionKey: 'session-reconcile', ownerId: 'worker-a', leaseDurationMs: 10,
+    }));
+    await store.enqueueControlOperation({
+      lease: firstLease,
+      operation: {
+        operationId: 'control:reconcile-completed',
+        sessionKey: 'session-reconcile',
+        payload: { action: 'close' },
+        createdAt: 1,
+      },
+    });
+    const firstAttempt = await store.beginControlOperationAttempt({
+      lease: firstLease, operationId: 'control:reconcile-completed',
+    });
+    if (firstAttempt.kind !== 'applied') throw new Error('expected first reconcile attempt');
+
+    now = 11;
+    const takeover = acquired(await store.acquireSessionLease({
+      sessionKey: 'session-reconcile', ownerId: 'worker-b', leaseDurationMs: 100,
+    }));
+    await store.beginControlOperationAttempt({
+      lease: takeover, operationId: 'control:reconcile-completed',
+    });
+    await expect(store.reconcileControlOperation({
+      lease: takeover,
+      operationId: 'control:reconcile-completed',
+      expectedAttempt: 1,
+      outcome: { kind: 'completed', result: {}, evidence: null },
+    })).rejects.toThrow(/evidence must be non-null/);
+    expect(await store.reconcileControlOperation({
+      lease: firstLease,
+      operationId: 'control:reconcile-completed',
+      expectedAttempt: 1,
+      outcome: { kind: 'completed', result: {}, evidence: { source: 'backend' } },
+    })).toEqual({ kind: 'stale_lease' });
+    expect(await store.reconcileControlOperation({
+      lease: takeover,
+      operationId: 'control:reconcile-completed',
+      expectedAttempt: 2,
+      outcome: { kind: 'completed', result: {}, evidence: { source: 'backend' } },
+    })).toEqual({ kind: 'stale' });
+    expect(await store.reconcileControlOperation({
+      lease: takeover,
+      operationId: 'control:reconcile-completed',
+      expectedAttempt: 1,
+      outcome: {
+        kind: 'completed',
+        result: { status: 'closed' },
+        evidence: { source: 'backend', remoteState: 'missing' },
+      },
+    })).toMatchObject({
+      kind: 'applied',
+      record: {
+        state: 'completed',
+        result: { status: 'closed' },
+        reconciliation: {
+          kind: 'completed', evidence: { source: 'backend', remoteState: 'missing' },
+        },
+      },
+    });
+
+    now = 12;
+    await store.enqueueControlOperation({
+      lease: takeover,
+      operation: {
+        operationId: 'control:reconcile-not-applied',
+        sessionKey: 'session-reconcile',
+        payload: { action: 'resume' },
+        createdAt: 12,
+      },
+    });
+    const notAppliedAttempt = await store.beginControlOperationAttempt({
+      lease: takeover, operationId: 'control:reconcile-not-applied',
+    });
+    if (notAppliedAttempt.kind !== 'applied') throw new Error('expected not-applied attempt');
+    expect(await store.markControlOperationAmbiguous({
+      attempt: notAppliedAttempt.attempt, error: 'transport result unknown',
+    })).toMatchObject({ kind: 'applied', record: { state: 'ambiguous' } });
+    now = 13;
+    expect(await store.reconcileControlOperation({
+      lease: takeover,
+      operationId: 'control:reconcile-not-applied',
+      expectedAttempt: 1,
+      outcome: {
+        kind: 'not_applied',
+        evidence: { source: 'backend', terminal: true },
+        error: 'backend proved the request was not applied',
+      },
+    })).toMatchObject({
+      kind: 'applied',
+      record: {
+        state: 'pending',
+        attempts: 1,
+        reconciliation: {
+          kind: 'not_applied', evidence: { source: 'backend', terminal: true },
+        },
+      },
+    });
+    expect(await store.reconcileControlOperation({
+      lease: takeover,
+      operationId: 'control:reconcile-not-applied',
+      expectedAttempt: 1,
+      outcome: {
+        kind: 'completed',
+        result: { status: 'must-not-complete-pending' },
+        evidence: { source: 'backend', terminal: true },
+      },
+    })).toEqual({ kind: 'stale' });
+    expect(await store.completeControlOperationAttempt({
+      attempt: notAppliedAttempt.attempt,
+      result: { status: 'resumed' },
+    })).toEqual({ kind: 'stale' });
+    const retried = await store.beginControlOperationAttempt({
+      lease: takeover, operationId: 'control:reconcile-not-applied',
+    });
+    expect(retried).toMatchObject({
+      kind: 'applied', record: { state: 'attempting', attempts: 2 },
+    });
     await store.close();
   });
 

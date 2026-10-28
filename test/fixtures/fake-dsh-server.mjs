@@ -31,6 +31,9 @@ import { appendFileSync } from 'node:fs';
  *                     turn/end with reason.error — the runner must surface it
  *   empty           - tool calls only, no assistant text (empty final)
  *   hang            - never goes idle (exercises the turn watchdog)
+ *   progressive     - tool progress outlasts the idle watchdog, then completes
+ *   endless-progress - tool progress never completes (exercises the hard limit)
+ *   unclaimed-progress - tool notifications without a matching inbox receipt
  */
 
 const scenario = process.env.FAKE_DSH_SCENARIO ?? 'happy';
@@ -40,7 +43,6 @@ const logPath = process.env.FAKE_DSH_LOG;
 if (process.argv[2] === 'plugin') {
   process.exit(0);
 }
-if (logPath) appendFileSync(logPath, JSON.stringify({ argv: process.argv.slice(2) }) + '\n');
 const expectedEnv = process.env.FAKE_DSH_EXPECT_ENV_JSON
   ? JSON.parse(process.env.FAKE_DSH_EXPECT_ENV_JSON)
   : {};
@@ -61,6 +63,25 @@ for (const name of expectedAbsentEnv) {
     process.exit(2);
   }
 }
+
+const launch = {
+  argv: process.argv.slice(2),
+  cwd: process.cwd(),
+  dshHome: process.env.DSH_HOME,
+  sessionRoot: process.env.DSH_SESSION_ROOT,
+  askTimeout: process.env.BOTMUX_DSH_ASK_TIMEOUT_MS,
+};
+if (process.argv.includes('--dump-config')) {
+  if (logPath) appendFileSync(logPath, JSON.stringify({ dump: launch }) + '\n');
+  if (process.env.FAKE_DSH_CONFIG_ERROR) {
+    process.stdout.write(process.env.FAKE_DSH_CONFIG ?? '[]\n');
+    process.stderr.write(process.env.FAKE_DSH_CONFIG_ERROR);
+    process.exit(2);
+  }
+  process.stdout.write(process.env.FAKE_DSH_CONFIG ?? '[]\n');
+  process.exit(0);
+}
+if (logPath) appendFileSync(logPath, JSON.stringify(launch) + '\n');
 
 let inputBuffer = '';
 let promptCount = 0;
@@ -202,6 +223,45 @@ function runEmptyTurn(sessionId, messageId) {
   notify('session.status', { sessionId, status: 'idle' });
 }
 
+function runProgressiveTurn(sessionId, messageId, endless = false) {
+  sendInboxReceipt(sessionId, messageId);
+  let count = 0;
+  const interval = setInterval(() => {
+    const callId = `call_progress_${++count}`;
+    sessionEvent(sessionId, {
+      type: 'tool/call',
+      data: { callId, name: 'bash', arguments: '{"command":"echo progress"}' },
+    });
+    sessionEvent(sessionId, {
+      type: 'tool/result',
+      data: {
+        message: {
+          source: { callId },
+          content: [{ type: 'tool-result', content: [], isError: false }],
+        },
+      },
+    });
+    if (count === 9 && !endless) {
+      clearInterval(interval);
+      sessionEvent(sessionId, {
+        type: 'assistant/message',
+        data: { message: { role: 'assistant', content: [{ type: 'text', text: finalText }] } },
+      });
+      notify('session.status', { sessionId, status: 'idle' });
+    }
+  }, 90);
+}
+
+function runUnclaimedProgress(sessionId) {
+  let count = 0;
+  setInterval(() => {
+    sessionEvent(sessionId, {
+      type: 'tool/call',
+      data: { callId: `unclaimed_${++count}`, name: 'bash', arguments: '{}' },
+    });
+  }, 90);
+}
+
 function handleLine(line) {
   let msg;
   try {
@@ -258,6 +318,10 @@ function handleLine(line) {
       else if (scenario === 'multi-step') runMultiStepTurn(sessionId, messageId);
       else if (scenario === 'stale') runStaleTurn(sessionId, messageId);
       else if (scenario === 'turn-error') runTurnErrorTurn(sessionId, messageId);
+      else if (scenario === 'progressive' || scenario === 'endless-progress') {
+        runProgressiveTurn(sessionId, messageId, scenario === 'endless-progress');
+      }
+      else if (scenario === 'unclaimed-progress') runUnclaimedProgress(sessionId);
       else runHappyTurn(sessionId, messageId);
     });
     return;

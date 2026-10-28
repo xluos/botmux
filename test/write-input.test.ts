@@ -39,7 +39,9 @@ vi.mock('node:child_process', () => {
   return {
     ...actual,
     execSync: vi.fn(() => ''),
-    execFileSync: vi.fn(),
+    // Bounded pid → open-file probes (utils/process-open-files) run lsof via
+    // execFileSync; mirror execSync's "ran fine, nothing open" stub.
+    execFileSync: vi.fn(() => ''),
     // writeInput's coco/codex paths call execFile. Spreading the real builtin
     // without stubbing it would spawn live CLIs and hang the file (measured).
     execFile: vi.fn((...args: unknown[]) => {
@@ -673,10 +675,16 @@ describe('supportsTypeAhead flag', () => {
     expect(createPiAdapter('/bin/pi').supportsTypeAhead).toBe(true);
   });
 
-  it('pi: exposes Working... as the explicit busy marker', () => {
+  it('pi: exposes its busy line as the explicit busy marker', () => {
     const adapter = createPiAdapter('/bin/pi');
+    // Pre-1.0 builds.
     expect(adapter.busyPattern?.test('⠙ Working...')).toBe(true);
+    // Pi 1.3.0: spinner frame + bare `Working` in the editor's top border.
+    expect(adapter.busyPattern?.test(`── ⠴ Working ${'─'.repeat(40)}`)).toBe(true);
+    expect(adapter.busyPattern?.test(' ⠏ Working')).toBe(true);
     expect(adapter.busyPattern?.test('已完成，等待下一条输入')).toBe(false);
+    expect(adapter.busyPattern?.test('Working through the implementation')).toBe(false);
+    expect(adapter.busyPattern?.test('── Working ──')).toBe(false);
   });
 
   it('pi: does not squash queued botmux turns (one card per Lark turn; steer merge reconciled by the bridge queue)', () => {
@@ -733,18 +741,24 @@ describe('writeInput: edge cases', () => {
     expect(pty.sendSpecialKeys).toHaveBeenCalledWith('Enter');
   });
 
-  it('cursor: submits then activates the follow-up steer action in tmux', async () => {
+  // #1504 regression: exactly ONE Enter per write. A second Enter on a
+  // queued follow-up is Cursor's "steer" — it detaches a running shell tool
+  // into a background task whose completion later makes Cursor inject a
+  // synthetic "Briefly inform the user about the task result…" turn (the
+  // "auto-continue after final" symptom), and it races the follow-ups panel
+  // re-render (lost Enter → message parked at "enter steer"). Cursor submits a
+  // queued follow-up by itself at the turn boundary, so one Enter is enough.
+  it('cursor: submits with a single Enter in tmux (no follow-up steer)', async () => {
     vi.useFakeTimers();
     try {
       const adapter = createCursorAdapter('/bin/cursor-agent');
       const pty = makeTmuxPty();
-      const write = adapter.writeInput(pty, 'steer this turn');
+      const write = adapter.writeInput(pty, 'queue this turn');
       await flushFakeTimers();
       await write;
 
-      expect(pty.sendText).toHaveBeenCalledWith('steer this turn');
+      expect(pty.sendText).toHaveBeenCalledWith('queue this turn');
       expect(pty.sendSpecialKeys.mock.calls).toEqual([
-        ['Enter'],
         ['Enter'],
       ]);
     } finally {
@@ -752,20 +766,37 @@ describe('writeInput: edge cases', () => {
     }
   });
 
-  it('cursor: submits then activates follow-up steering in raw PTY mode', async () => {
+  it('cursor: submits with a single Enter in raw PTY mode (no follow-up steer)', async () => {
     vi.useFakeTimers();
     try {
       const adapter = createCursorAdapter('/bin/cursor-agent');
       const pty = makeRawPty();
-      const write = adapter.writeInput(pty, 'steer raw turn');
+      const write = adapter.writeInput(pty, 'queue raw turn');
       await flushFakeTimers();
       await write;
 
       expect(pty.write.mock.calls.map(c => c[0])).toEqual([
-        'steer raw turn',
-        '\r',
+        'queue raw turn',
         '\r',
       ]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('cursor: a multi-line type-ahead message still ends with exactly one Enter', async () => {
+    vi.useFakeTimers();
+    try {
+      const adapter = createCursorAdapter('/bin/cursor-agent');
+      const pty = makeTmuxPty();
+      const write = adapter.writeInput(pty, '<botmux_routing>\nline two\n</botmux_routing>');
+      await flushFakeTimers();
+      await write;
+
+      // Soft newlines are C-j; the only Enter is the final submit.
+      expect(pty.sendSpecialKeys.mock.calls.filter(c => c[0] === 'Enter')).toHaveLength(1);
+      expect(pty.sendSpecialKeys.mock.calls.filter(c => c[0] === 'C-j')).toHaveLength(2);
+      expect(pty.sendSpecialKeys.mock.calls[pty.sendSpecialKeys.mock.calls.length - 1]).toEqual(['Enter']);
     } finally {
       vi.useRealTimers();
     }
@@ -1345,6 +1376,10 @@ Active whiteboard content
   <name>Project Group</name>
 </chat_context>
 
+<botmux_lark_tool>
+  lark-cli defaults to the current bot.
+</botmux_lark_tool>
+
 Fix the test suite failure on CI
 
 <sender type="user" id="ou_123" />
@@ -1356,6 +1391,7 @@ Fix the test suite failure on CI
     expect(hookPayload).not.toContain('chat_context');
     expect(hookPayload).not.toContain('whiteboard');
     expect(hookPayload).not.toContain('attachments');
+    expect(hookPayload).not.toContain('botmux_lark_tool');
 
     // ReDoS safety on unclosed <user_message>
     const unclosed = '<user_message>'.repeat(3000) + 'safe content';
@@ -1764,7 +1800,8 @@ describe('codex writeInput submission confirmation', () => {
       captureCurrentScreen: () => '', captureInputState: () => null,
     };
     const result = await createCodexAdapter('/bin/codex').writeInput(pty, 'hi');
-    expect(result).toEqual({ submitted: true });
+    // The unproven id is only a candidate, never the session.
+    expect(result).toEqual({ submitted: true, unprovenCliSessionId: 'foreign-session' });
     expect(sendText).not.toHaveBeenCalled();
     expect(pasteText).toHaveBeenCalledExactlyOnceWith('hi');
     expect(pty.sendSpecialKeys).toHaveBeenCalledExactlyOnceWith('Enter');

@@ -29,6 +29,7 @@ function makeDeps(overrides: Partial<SettingsWriteApplierDeps> = {}): SettingsWr
     herdrTraexPlugin: { enabled: false, source: '', ref: '', recommendedSource: '', recommendedRef: '' },
     codexRpcInput: false,
     autoUpgradeCodexSessions: true,
+    reapOrphanTmuxServers: false,
     codexNotifier: {
       enabled: false,
       targetBotAppId: null,
@@ -45,6 +46,7 @@ function makeDeps(overrides: Partial<SettingsWriteApplierDeps> = {}): SettingsWr
     vcMeetingAgent: { enabled: true },
     workflow: { enabled: true },
     sessionCleanup: { enabled: false, olderThanHours: 168, intervalMinutes: 60 },
+    promptCache: null,
     multiTopic: { enabled: true },
     maintenance: {},
     localDevInstall: false,
@@ -123,6 +125,16 @@ describe('resolveCodexNotifierRecipientView', () => {
 });
 
 describe('applySettingsWrite happy paths', () => {
+  it('runs the complete settings write inside one injected config transaction', async () => {
+    const runConfigMutation = vi.fn(async <T>(mutation: () => Promise<T>) => mutation());
+    const deps = makeDeps({ runConfigMutation });
+    const result = await applySettingsWrite({ publicReadOnly: true, repoPickerMode: 'repos' }, deps);
+    expect(result.ok).toBe(true);
+    expect(runConfigMutation).toHaveBeenCalledOnce();
+    expect(deps.mergeDashboardConfig).toHaveBeenCalledWith({ publicReadOnly: true });
+    expect(deps.mergeGlobalConfig).toHaveBeenCalledWith({ repoPickerMode: 'repos' });
+  });
+
   it('preserves separator whitespace in groupNamePrefix', async () => {
     const deps = makeDeps();
     const r = await applySettingsWrite({ groupNamePrefix: '[AI] ' }, deps);
@@ -193,6 +205,13 @@ describe('applySettingsWrite happy paths', () => {
     const r = await applySettingsWrite({ autoUpgradeCodexSessions: enabled }, deps);
     expect(r.ok).toBe(true);
     expect(deps.mergeDashboardConfig).toHaveBeenCalledWith({ autoUpgradeCodexSessions: enabled });
+  });
+
+  it.each([false, true])('writes reapOrphanTmuxServers=%s through the dashboard segment', async (enabled) => {
+    const deps = makeDeps();
+    const r = await applySettingsWrite({ reapOrphanTmuxServers: enabled }, deps);
+    expect(r.ok).toBe(true);
+    expect(deps.mergeDashboardConfig).toHaveBeenCalledWith({ reapOrphanTmuxServers: enabled });
   });
 
   it('writes bypassCodexHookTrust=false (the disable path — the whole point of a default-ON toggle)', async () => {
@@ -559,6 +578,13 @@ describe('applySettingsWrite — validation errors', () => {
     const deps = makeDeps();
     const r = await applySettingsWrite({ autoUpgradeCodexSessions: value }, deps);
     expect(r).toEqual({ ok: false, error: 'invalid_autoUpgradeCodexSessions' });
+    expect(deps.mergeDashboardConfig).not.toHaveBeenCalled();
+  });
+
+  it.each(['true', 1, null])('rejects invalid reapOrphanTmuxServers=%s without writing settings', async (value) => {
+    const deps = makeDeps();
+    const r = await applySettingsWrite({ reapOrphanTmuxServers: value }, deps);
+    expect(r).toEqual({ ok: false, error: 'invalid_reapOrphanTmuxServers' });
     expect(deps.mergeDashboardConfig).not.toHaveBeenCalled();
   });
 
@@ -1025,6 +1051,52 @@ describe('applySettingsWrite — oauthRedirectBase', () => {
   }
 });
 
+// httpProxy 是二进制自更新从 GitHub Releases 下载时的出站代理（release-download 用它建
+// CONNECT 隧道，且总是以明文 HTTP 连代理）。只收 http://[user:pass@]host[:port]，凭证允许，
+// https:// / 路径 / query 拒。
+describe('applySettingsWrite — httpProxy', () => {
+  for (const [label, value, stored] of [
+    ['a plain http proxy', 'http://127.0.0.1:7890', 'http://127.0.0.1:7890'],
+    ['embedded credentials', 'http://user:p%40ss@proxy.example.com:8080', 'http://user:p%40ss@proxy.example.com:8080'],
+    ['surrounding whitespace and trailing slashes', '  http://127.0.0.1:7890//  ', 'http://127.0.0.1:7890'],
+  ] as Array<[string, string, string]>) {
+    it(`persists ${label}`, async () => {
+      const deps = makeDeps();
+      const r = await applySettingsWrite({ httpProxy: value }, deps);
+      expect(r.ok).toBe(true);
+      expect(deps.mergeGlobalConfig).toHaveBeenCalledWith({ httpProxy: stored });
+    });
+  }
+
+  for (const value of ['', '   ', null]) {
+    it(`clears the setting on ${JSON.stringify(value)}`, async () => {
+      const deps = makeDeps();
+      const r = await applySettingsWrite({ httpProxy: value }, deps);
+      expect(r.ok).toBe(true);
+      expect(deps.mergeGlobalConfig).toHaveBeenCalledWith({ httpProxy: null });
+    });
+  }
+
+  for (const [label, value] of [
+    ['a bare host without a scheme', '127.0.0.1:7890'],
+    ['a socks scheme (release-download only tunnels over HTTP CONNECT)', 'socks5://127.0.0.1:1080'],
+    ['an https:// proxy (the CONNECT tunnel dials the proxy over plain HTTP)', 'https://proxy.example.com:8443'],
+    ['a path', 'http://127.0.0.1:7890/proxy'],
+    ['a query string', 'http://127.0.0.1:7890?x=1'],
+    ['a scheme with no host', 'http://'],
+    ['a non-string value', 7890],
+  ] as Array<[string, unknown]>) {
+    it(`rejects ${label} → invalid_httpProxy (no write)`, async () => {
+      const deps = makeDeps();
+      const r = await applySettingsWrite({ httpProxy: value }, deps);
+      expect(r.ok).toBe(false);
+      if (r.ok) throw new Error('unreachable');
+      expect(r.error).toBe('invalid_httpProxy');
+      expect(deps.mergeGlobalConfig).not.toHaveBeenCalled();
+    });
+  }
+});
+
 describe('applySettingsWrite — IO surface', () => {
   it('does not touch maintenance merge when only dashboard fields are present', async () => {
     const deps = makeDeps();
@@ -1160,6 +1232,29 @@ describe('applySettingsWrite — hostOverloadAlert', () => {
   });
 });
 
+describe('applySettingsWrite promptCache', () => {
+  it('writes a normalized block and clears it with null', async () => {
+    const deps = makeDeps();
+    const r = await applySettingsWrite({
+      promptCache: { ttl: '1h', keepalive: { enabled: true, activeHours: '10:00-23:00' } },
+    }, deps);
+    expect(r.ok).toBe(true);
+    expect(deps.mergeGlobalConfig).toHaveBeenCalledWith({
+      promptCache: { ttl: '1h', keepalive: { enabled: true, activeHours: '10:00-23:00' } },
+    });
+    const cleared = await applySettingsWrite({ promptCache: null }, deps);
+    expect(cleared.ok).toBe(true);
+    expect(deps.mergeGlobalConfig).toHaveBeenLastCalledWith({ promptCache: null });
+  });
+
+  it('rejects typos instead of silently falling back to defaults', async () => {
+    const deps = makeDeps();
+    const r = await applySettingsWrite({ promptCache: { keepalive: { idleMinutes: 90 } } }, deps);
+    expect(r).toEqual({ ok: false, error: 'invalid_promptCache' });
+    expect(deps.mergeGlobalConfig).not.toHaveBeenCalled();
+  });
+});
+
 describe('applySettingsWrite sessionCleanup', () => {
   it('writes a full sessionCleanup block', async () => {
     const deps = makeDeps();
@@ -1222,5 +1317,20 @@ describe('applySettingsWrite sessionCleanup', () => {
     expect(deps.mergeGlobalConfig).toHaveBeenCalledWith({
       sessionCleanup: { intervalMinutes: 90 },
     });
+  });
+});
+
+
+describe('Codex idle cleanup setting', () => {
+  it('accepts a standalone opt-in patch and preserves scheduled cleanup fields', async () => {
+    const deps = makeDeps({ readGlobalConfig: () => ({ sessionCleanup: { enabled: true, olderThanHours: 72 } }) });
+    const r = await applySettingsWrite({ sessionCleanup: { archiveCodex: true } }, deps);
+    expect(r.ok).toBe(true);
+    expect(deps.mergeGlobalConfig).toHaveBeenCalledWith({ sessionCleanup: { enabled: true, olderThanHours: 72, archiveCodex: true } });
+  });
+  it('rejects nonboolean values', async () => {
+    const deps = makeDeps();
+    expect(await applySettingsWrite({ sessionCleanup: { archiveCodex: 'true' } }, deps)).toEqual({ ok: false, error: 'invalid_sessionCleanup_archiveCodex' });
+    expect(deps.mergeGlobalConfig).not.toHaveBeenCalled();
   });
 });

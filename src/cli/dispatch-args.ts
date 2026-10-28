@@ -8,6 +8,8 @@ export interface DispatchArgs {
   briefFile?: string;
   chatId?: string;
   repo?: string;
+  model?: string;
+  reasoningEffort?: string;
   into?: string;
   resultDelivery?: string;
   standby: boolean;
@@ -21,14 +23,15 @@ export interface DispatchArgs {
 export type DispatchArgsErrorCode =
   | 'UNKNOWN_OPTION'
   | 'UNEXPECTED_ARGUMENT'
-  | 'OPTION_VALUE_REQUIRED';
+  | 'OPTION_VALUE_REQUIRED'
+  | 'DUPLICATE_OPTION';
 
 export type DispatchArgsResult =
   | { ok: true; value: DispatchArgs }
   | { ok: false; errorCode: DispatchArgsErrorCode; error: string; option?: string };
 
 const VALUE_FLAGS = new Map<string, keyof Pick<DispatchArgs,
-  'sessionId' | 'title' | 'brief' | 'briefFile' | 'chatId' | 'repo' | 'into' | 'resultDelivery'
+  'sessionId' | 'title' | 'brief' | 'briefFile' | 'chatId' | 'repo' | 'into' | 'resultDelivery' | 'model' | 'reasoningEffort'
 >>([
   ['--session-id', 'sessionId'],
   ['--title', 'title'],
@@ -38,6 +41,8 @@ const VALUE_FLAGS = new Map<string, keyof Pick<DispatchArgs,
   ['--repo', 'repo'],
   ['--into', 'into'],
   ['--result-delivery', 'resultDelivery'],
+  ['--model', 'model'],
+  ['--reasoning-effort', 'reasoningEffort'],
 ]);
 
 const REPEATABLE_VALUE_FLAGS = new Map<string, 'bots' | 'botApps'>([
@@ -113,6 +118,10 @@ export function parseDispatchArgs(args: readonly string[]): DispatchArgsResult {
       }
       if (equals < 0) index += 1;
       if (singletonKey) {
+        if ((singletonKey === 'model' || singletonKey === 'reasoningEffort')
+            && value[singletonKey] !== undefined) {
+          return fail('DUPLICATE_OPTION', `${flag} may only be specified once`, flag);
+        }
         // argValue historically returned the first occurrence. Keep that
         // precedence while still consuming and validating every token.
         if (value[singletonKey] === undefined) value[singletonKey] = optionValue;

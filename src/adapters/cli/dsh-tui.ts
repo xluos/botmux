@@ -3,6 +3,7 @@ import { resolveCommand } from './registry.js';
 import type { CliAdapter, PtyHandle } from './types.js';
 
 import { delay } from '../../utils/timing.js';
+import { wrapBracketedPaste } from './tui-input.js';
 import { mkdirSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
@@ -17,11 +18,8 @@ function dshAuthPaths(): string[] {
   return configured ? ['~/.dsh', configured, '~/.dsh-tui'] : ['~/.dsh', '~/.dsh-tui'];
 }
 
-const BRACKETED_PASTE_START = '\x1b[200~';
-const BRACKETED_PASTE_END = '\x1b[201~';
-
 function sendBracketedPaste(pty: PtyHandle, content: string): boolean {
-  const framed = `${BRACKETED_PASTE_START}${content}${BRACKETED_PASTE_END}`;
+  const framed = wrapBracketedPaste(content);
   if (pty.sendText) return pty.sendText(framed) !== false;
   return pty.write(framed) !== false;
 }
@@ -175,8 +173,8 @@ export function createDshTuiAdapter(pathOverride?: string): CliAdapter {
     // 45s, which — with supportsTypeAhead — would flush into a composer that may
     // not be mounted yet and pre-empt the 90s protection above. That alignment
     // is this explicit opt-in, not a derivation from the shared
-    // `deferFirstPromptTimeoutUntilReady` + readyPattern flags: grok declares
-    // both of those and must keep its 45s fallback.
+    // `deferFirstPromptTimeoutUntilReady` + readyPattern flags: the other
+    // adapters carrying both of those (Hermes, Grok) do not arm the gate at all.
     injectsReadyHook: true,
     readyGateFallbackAlignedWithHardCap: true,
     // Turn ends come from the same plugin, not from PTY silence: `agent/status`
@@ -200,5 +198,3 @@ export function createDshTuiAdapter(pathOverride?: string): CliAdapter {
     modelChoices: CLI_MODEL_CHOICES['dsh-tui'],
   };
 }
-
-export const create = createDshTuiAdapter;

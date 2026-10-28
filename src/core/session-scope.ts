@@ -165,6 +165,16 @@ export function sessionScopeUnitName(sessionId: string): string {
   return `botmux-session-${safe || 'unknown'}.scope`;
 }
 
+const SESSION_SCOPE_UNIT_RE = /^botmux-session-[a-z0-9_.-]+\.scope$/;
+
+/** Whether a systemd unit is a per-session cleanup scope botmux itself created
+ *  (see {@link sessionScopeUnitName} / {@link wrapCommandInSessionScope}). The
+ *  fleet cgroup move may leave ONLY one of these: every other unit was chosen
+ *  by whoever launched the supervisor and must keep owning it. */
+export function isBotmuxSessionScopeUnit(unit: string): boolean {
+  return SESSION_SCOPE_UNIT_RE.test(unit);
+}
+
 export interface ScopedCommand {
   bin: string;
   args: string[];
@@ -182,6 +192,57 @@ export function shouldWrapCommandInSessionScope(options: {
     && !options.willReattachPersistent
     && !options.remoteBackend
     && !options.workflowWorker;
+}
+
+/**
+ * Whether `pid` has exited and is only waiting to be reaped (a zombie). Such a
+ * process is nobody's launch payload. A login shell that runs a hook in the
+ * background (autojump, …) and then execs leaves exactly this: an unreaped
+ * child under whatever it exec'd into, which never reaps it. Counting it as a
+ * child would make a single-payload launch layer look ambiguous forever.
+ * Linux only; an unreadable stat (process gone, other platforms) is "no".
+ */
+export function isZombieProcess(
+  pid: number,
+  read: (path: string) => string = path => readFileSync(path, 'utf8'),
+): boolean {
+  try {
+    const stat = read(`/proc/${pid}/stat`);
+    const close = stat.lastIndexOf(')');
+    const state = close >= 0 ? stat.slice(close + 2, close + 3) : '';
+    return state === 'Z' || state === 'X';
+  } catch {
+    return false;
+  }
+}
+
+const SCOPE_PARENT_SCRIPT = '"$@"; status=$?; exit "$status"';
+const SCOPE_PARENT_NAME = 'botmux-session-scope';
+
+/** Resolve only our fixed scope supervisor, never an arbitrary interactive
+ * shell. Its single foreground child execs systemd-run and then the payload.
+ * A missing/ambiguous child retains the shell identity and the input guard. */
+export function sessionScopePayloadPid(panePid: number, options: {
+  platform?: NodeJS.Platform;
+  readFile?: (path: string) => string;
+} = {}): number {
+  if ((options.platform ?? process.platform) !== 'linux') return panePid;
+  const read = options.readFile ?? (path => readFileSync(path, 'utf8'));
+  try {
+    const argv = read(`/proc/${panePid}/cmdline`).split('\0');
+    if (argv[0] !== '/bin/sh' || argv[1] !== '-c'
+      || argv[2] !== SCOPE_PARENT_SCRIPT || argv[3] !== SCOPE_PARENT_NAME
+      || argv[4] !== 'systemd-run' || argv[5] !== '--user' || argv[6] !== '--scope'
+      || argv[7] !== '--quiet' || argv[8] !== '--collect'
+      || !/^--unit=botmux-session-[a-z0-9_.-]+\.scope$/.test(argv[9] ?? '')) return panePid;
+    const children = read(`/proc/${panePid}/task/${panePid}/children`).trim().split(/\s+/)
+      .filter(child => !(/^[1-9]\d*$/.test(child) && isZombieProcess(Number(child), read)));
+    if (children.length !== 1 || !/^[1-9]\d*$/.test(children[0])) return panePid;
+    const child = Number(children[0]);
+    return Number.isSafeInteger(child) && child > 1 && child !== panePid ? child : panePid;
+  } catch {
+    return panePid;
+  }
 }
 
 export function wrapCommandInSessionScope(
@@ -214,7 +275,13 @@ export function wrapCommandInSessionScope(
     // all forward arbitrary caller env keys, and a long-lived tmux server may
     // have started before the login bus existed.
     bin: '/usr/bin/env',
-    args: [...envArgs, 'systemd-run', ...scopeArgs],
+    // Keep the pane PID outside the owned scope. Some tmux versions move that
+    // PID into their own cgroup from the server after fork; an exec-only wrapper
+    // lets that late move steal the CLI from our scope. The post-command status
+    // handling prevents sh from execing systemd-run, while preserving foreground
+    // stdin and the payload's exit status (an async shell list would lose stdin).
+    args: [...envArgs, '/bin/sh', '-c', SCOPE_PARENT_SCRIPT,
+      SCOPE_PARENT_NAME, 'systemd-run', ...scopeArgs],
     unitName,
     capabilities,
   };

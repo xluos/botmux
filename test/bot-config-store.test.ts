@@ -9,6 +9,11 @@ import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { validateCodexServiceTier } from '../src/services/codex-service-tier-catalog.js';
+
+vi.mock('../src/services/codex-service-tier-catalog.js', () => ({
+  validateCodexServiceTier: vi.fn(async () => ({ ok: true })),
+}));
 
 vi.mock('@larksuiteoapi/node-sdk', () => {
   class FakeClient {
@@ -20,7 +25,8 @@ vi.mock('@larksuiteoapi/node-sdk', () => {
 
 // Stub the Lark client so setBotAllowedUsers resolves emails/on_ → fake open_ids
 // without any network. Mirrors resolveAllowedUsersWithMap's contract: pass ou_
-// through, on_xxx → ou_xxx, email → ou_<localpart>, anything else is dropped.
+// through, on_xxx → ou_xxx, email → ou_<localpart> (except ghost@*, which models
+// a definitive miss: no such user / not visible), anything else is dropped.
 vi.mock('../src/im/lark/client.js', () => ({
   resolveAllowedUsersWithMap: async (_appId: string, raw: string[]) => {
     const map = new Map<string, string>();
@@ -30,11 +36,12 @@ vi.mock('../src/im/lark/client.js', () => ({
       let id: string | undefined;
       if (v.startsWith('ou_')) id = v;
       else if (v.startsWith('on_')) id = 'ou_' + v.slice(3);
-      else if (v.includes('@')) id = 'ou_' + v.split('@')[0];
+      else if (v.includes('@') && !v.startsWith('ghost@')) id = 'ou_' + v.split('@')[0];
       if (id) { resolved.push(id); map.set(v, id); entryStatus.set(v, 'resolved'); }
       else entryStatus.set(v, 'definitive');
     }
-    return { resolved, map, entryStatus };
+    const definitiveMisses = raw.filter(v => entryStatus.get(v) === 'definitive');
+    return { resolved, map, entryStatus, definitiveMisses };
   },
 }));
 
@@ -56,6 +63,7 @@ describe('bot-config store', () => {
     // Isolate the allowedUsers sidecar (setBotAllowedUsers writes it) into the
     // same tmp dir so tests don't pollute the real ~/.botmux/data.
     process.env.SESSION_DATA_DIR = dir;
+    vi.mocked(validateCodexServiceTier).mockReset().mockResolvedValue({ ok: true });
   });
   afterEach(() => { delete process.env.BOTS_CONFIG; delete process.env.SESSION_DATA_DIR; });
 
@@ -120,6 +128,76 @@ describe('bot-config store', () => {
     expect(readConfig().replyDelivery).toBe('send');
   });
 
+  it.each([
+    ['codex', { id: 'vendor-codex', executable: '/opt/bin/vendor-codex' }, 'kimi'],
+    ['kimi', { id: 'codem', displayName: 'CodeM', executable: '/opt/bin/codem-wrapper' }, 'codex'],
+  ] as const)('/config cli switch %s -> %s drops the stranded structured runtime on disk and in memory', async (fromCli, runtime, toCli) => {
+    const { registry, store } = await loaded({
+      cliId: fromCli,
+      cliRuntime: { ...runtime, update: { provider: 'none' } },
+      cliPathOverride: runtime.executable,
+    });
+    const changed = await store.applyConfigField('app_default', store.findConfigField('cli')!, toCli);
+    expect(changed).toMatchObject({ ok: true });
+    // Disk: descriptor and its equal downgrade shadow are both gone.
+    expect(readConfig()).toMatchObject({ cliId: toCli });
+    expect(readConfig().cliRuntime).toBeUndefined();
+    expect(readConfig().cliPathOverride).toBeUndefined();
+    // Memory config must match the persisted generation (new sessions read it).
+    const live = registry.getBot('app_default').config;
+    expect(live.cliRuntime).toBeUndefined();
+    expect(live.cliPathOverride).toBeUndefined();
+    // A fresh reload accepts the next generation instead of running one
+    // family's binary under the other family's interaction contract.
+    expect(() => registry.loadBotConfigs()).not.toThrow();
+  });
+
+  it.each([
+    ['codex', { id: 'vendor-codex', executable: '/opt/bin/vendor-codex' }],
+    ['kimi', { id: 'codem', displayName: 'CodeM', executable: '/opt/bin/codem-wrapper' }],
+  ] as const)('/config cli re-selecting the same %s family preserves its structured runtime', async (cliId, runtime) => {
+    const { store } = await loaded({
+      cliId,
+      cliRuntime: { ...runtime, update: { provider: 'none' } },
+      cliPathOverride: runtime.executable,
+    });
+    const changed = await store.applyConfigField('app_default', store.findConfigField('cli')!, cliId);
+    expect(changed).toMatchObject({ ok: true });
+    expect(readConfig()).toMatchObject({
+      cliId,
+      cliRuntime: expect.objectContaining({ id: runtime.id }),
+      cliPathOverride: runtime.executable,
+    });
+  });
+
+  it('/config cli switch keeps an unrelated legacy cliPathOverride but clears a switch to an unsupported adapter', async () => {
+    // Legacy raw paths predate structured runtimes and are deliberately not
+    // scoped to an adapter family — same parity as setup edits.
+    {
+      const { store } = await loaded({ cliId: 'codex', cliPathOverride: '/opt/legacy-router' });
+      const changed = await store.applyConfigField('app_default', store.findConfigField('cli')!, 'kimi');
+      expect(changed).toMatchObject({ ok: true });
+      expect(readConfig()).toMatchObject({ cliId: 'kimi', cliPathOverride: '/opt/legacy-router' });
+      expect(readConfig().cliRuntime).toBeUndefined();
+    }
+    // Structured runtime + switch to an adapter that has no runtime support:
+    // the descriptor is cleared, so the next generation reloads instead of
+    // failing the whole bots.json parse.
+    {
+      const { registry, store } = await loaded({
+        cliId: 'codex',
+        cliRuntime: { id: 'vendor-codex', executable: '/opt/bin/vendor-codex' },
+        cliPathOverride: '/opt/bin/vendor-codex',
+      });
+      const changed = await store.applyConfigField('app_default', store.findConfigField('cli')!, 'claude-code');
+      expect(changed).toMatchObject({ ok: true });
+      expect(readConfig()).toMatchObject({ cliId: 'claude-code' });
+      expect(readConfig().cliRuntime).toBeUndefined();
+      expect(readConfig().cliPathOverride).toBeUndefined();
+      expect(() => registry.loadBotConfigs()).not.toThrow();
+    }
+  });
+
   it.each(['traex', 'coco', 'hermes', 'mtr', 'pi', 'oh-my-pi', 'ebsd', 'grok'])('enables zero injection for %s using its final-reply capability', async (cliId) => {
     const { store } = await loaded({ cliId, replyDelivery: 'send' });
     expect((await store.applyConfigField('app_default', store.findConfigField('promptInjection')!, 'none')).ok).toBe(true);
@@ -132,6 +210,50 @@ describe('bot-config store', () => {
     const { store } = await loaded({ cliId, codexRpcInput: true });
     expect((await store.applyConfigField('app_default', store.findConfigField('promptInjection')!, 'none')).ok).toBe(true);
     expect(readConfig()).toMatchObject({ promptInjection: 'none', codexRpcInput: true });
+  });
+
+  it('judges zero injection on the effective backend (daemon default when not overridden)', async () => {
+    process.env.BACKEND_TYPE = 'zmx';
+    try {
+      // antigravity zero injection cannot run on zmx; with no override the session uses it.
+      const { store } = await loaded({ cliId: 'antigravity' });
+      const zero = store.findConfigField('promptInjection')!;
+      expect(await store.applyConfigField('app_default', zero, 'none'))
+        .toMatchObject({ ok: false, reason: 'zero_prompt_unsupported' });
+      const backend = store.findConfigField('backendType')!;
+      expect((await store.applyConfigField('app_default', backend, 'tmux')).ok).toBe(true);
+      expect((await store.applyConfigField('app_default', zero, 'none')).ok).toBe(true);
+      // Clearing the override falls back to zmx: refused while zero injection is on.
+      expect(await store.applyConfigField('app_default', backend, null))
+        .toMatchObject({ ok: false, reason: 'zero_prompt_unsupported' });
+      expect(readConfig().backendType).toBe('tmux');
+    } finally {
+      delete process.env.BACKEND_TYPE;
+    }
+  });
+
+  it('pairs a remote daemon default back to pty for a local CLI, as spawning does', async () => {
+    process.env.BACKEND_TYPE = 'riff';
+    try {
+      // claude-code never spawns on riff: the pairing resolves it to pty, which supports zero injection.
+      const { store } = await loaded({ cliId: 'claude-code' });
+      expect((await store.applyConfigField('app_default', store.findConfigField('promptInjection')!, 'none')).ok).toBe(true);
+      // Runtime prompt construction agrees with the accepted write.
+      const { zeroPromptInjectionForBot } = await import('../src/core/prompt-injection.js');
+      expect(zeroPromptInjectionForBot('app_default')).toBe(true);
+    } finally {
+      delete process.env.BACKEND_TYPE;
+    }
+  });
+
+  it('treats a stale remote backend override on a local CLI the way spawning does', async () => {
+    // e.g. left over after switching away from a remote CLI: spawn pairs it back to local.
+    const { store } = await loaded({ cliId: 'claude-code', backendType: 'riff', replyDelivery: 'send' });
+    expect((await store.applyConfigField('app_default', store.findConfigField('promptInjection')!, 'none')).ok).toBe(true);
+    const { zeroPromptInjectionForBot } = await import('../src/core/prompt-injection.js');
+    expect(zeroPromptInjectionForBot('app_default')).toBe(true);
+    const { effectiveReplyDelivery } = await import('../src/core/reply-delivery.js');
+    expect(effectiveReplyDelivery('app_default', 'claude-code')).toBe('transcript');
   });
 
   it('rejects zero injection without automatic reply support', async () => {
@@ -176,6 +298,97 @@ describe('bot-config store', () => {
     expect(keys).toContain('feedback');
     expect(keys).toContain('showReplyTiming');
     expect(keys).toContain('cardActionAckTimeoutMs');
+    expect(keys).toContain('herdr');
+  });
+
+  it('strictly normalizes the herdr JSON field and clears an empty block', async () => {
+    const { registry, store } = await loaded();
+    const spec = store.findConfigField('herdr')!;
+    expect(spec).toMatchObject({ kind: 'json', effect: 'next-session', clearable: true });
+    // 合法块：trim 文本、保留枚举与 chatTypes。
+    const ok = store.coerceConfigValue(spec, JSON.stringify({
+      sessionName: ' default ',
+      placement: 'split',
+      workspace: '  ',
+      tab: '3',
+      splitDirection: 'right',
+      chatTypes: ['group'],
+    }));
+    expect(ok).toEqual({
+      ok: true,
+      value: { sessionName: 'default', placement: 'split', tab: '3', splitDirection: 'right', chatTypes: ['group'] },
+    });
+    expect((await store.applyConfigField('app_default', spec, (ok as any).value)).ok).toBe(true);
+    expect(readConfig().herdr).toEqual({ sessionName: 'default', placement: 'split', tab: '3', splitDirection: 'right', chatTypes: ['group'] });
+    expect(registry.getBot('app_default').config.herdr).toEqual(readConfig().herdr);
+    // 非法 placement / 未知字段 / 错误类型显式拒绝（不静默剔除），且不动已落盘配置。
+    for (const bad of [
+      { placement: 'nope' },
+      { session: 'default' },
+      { sessionName: 3 },
+      { chatTypes: ['group', 'x'] },
+      [1, 2],
+    ]) {
+      const rejected = store.coerceConfigValue(spec, JSON.stringify(bad));
+      expect(rejected.ok, JSON.stringify(bad)).toBe(false);
+      expect((rejected as any).reason).toContain('invalid_herdr_config');
+    }
+    expect(readConfig().herdr).toBeDefined();
+    // chatTypes 重复值与 bots.json/env 门一致：去重接受，不报错。
+    const dup = store.coerceConfigValue(spec, JSON.stringify({
+      sessionName: 'default', chatTypes: ['group', 'group', 'p2p'],
+    }));
+    expect(dup).toEqual({ ok: true, value: { sessionName: 'default', chatTypes: ['group', 'p2p'] } });
+    // 空对象归一为 null：applyConfigField 删除整个 herdr 键。
+    const empty = store.coerceConfigValue(spec, '{}');
+    expect(empty).toEqual({ ok: true, value: null });
+    expect((await store.applyConfigField('app_default', spec, null)).ok).toBe(true);
+    expect(readConfig()).not.toHaveProperty('herdr');
+    expect(registry.getBot('app_default').config.herdr).toBeUndefined();
+  });
+
+  it('rejects an inert herdr block through the shared /config coerce path too', async () => {
+    const { store } = await loaded();
+    const spec = store.findConfigField('herdr')!;
+    // IM /config set 与 Dashboard 共用 coerceConfigValue：无 sessionName/placement
+    // 时只填子字段必须拒绝，不能存出「零效果」块。
+    for (const raw of [{ tab: '3' }, { workspace: 'w' }, { splitDirection: 'down' }, { chatTypes: ['group'] }]) {
+      const r = store.coerceConfigValue(spec, JSON.stringify(raw));
+      expect(r.ok, JSON.stringify(raw)).toBe(false);
+      expect((r as any).reason).toContain('invalid_herdr_config');
+    }
+    // env 已提供 placement 时，只覆盖 tab 的部分块合法（字段级叠加）。
+    const cfg = (await import('../src/config.js')).config.daemon as { herdr?: unknown };
+    const prev = cfg.herdr;
+    cfg.herdr = { placement: 'split' };
+    try {
+      expect(store.coerceConfigValue(spec, JSON.stringify({ tab: '3' }))).toEqual({ ok: true, value: { tab: '3' } });
+    } finally {
+      if (prev === undefined) delete cfg.herdr; else cfg.herdr = prev;
+    }
+  });
+
+  it('keeps the strict herdr field list in parity with the normalizer', async () => {
+    const { store } = await loaded();
+    const types = await import('../src/adapters/backend/types.js');
+    const spec = store.findConfigField('herdr')!;
+    const allFields = types.normalizeHerdrBackendConfig({
+      sessionName: 'default', placement: 'split', workspace: 'w', tab: 't',
+      splitDirection: 'right', chatTypes: ['group', 'p2p'],
+    });
+    // 严格门字段表必须与归一器实际接受的键完全一致：漏一个就会把新字段当
+    // 未知字段拒绝（或两边语义分叉）。
+    expect([...store.HERDR_FIELD_NAMES].sort()).toEqual(Object.keys(allFields).sort());
+    // 每个字段单独传入都能被严格门识别为已知字段（不报「不是可识别字段」）。
+    for (const key of store.HERDR_FIELD_NAMES) {
+      const value = key === 'placement' ? 'workspace'
+        : key === 'splitDirection' ? 'right'
+        : key === 'chatTypes' ? ['group']
+        : key === 'sessionName' ? 's' : 'x';
+      const r = store.coerceConfigValue(spec, JSON.stringify({ [key]: value }));
+      if (r.ok === false) expect(r.reason).not.toContain('不是可识别字段');
+    }
+    void spec;
   });
 
   it('strictly normalizes feedback JSON through the shared config field', async () => {
@@ -186,6 +399,130 @@ describe('bot-config store', () => {
       value: { enabled: true, audience: 'requester' },
     });
     expect(store.coerceConfigValue(spec, '{"enabled":true,"audience":"all"}')).toEqual({ ok: false, reason: 'invalid_json' });
+  });
+
+  it('hot-updates sender email hiding through botconfig and reloads it', async () => {
+    const { registry, store } = await loaded({ cliId: 'codex' });
+    const spec = store.findConfigField('senderTagHideEmail')!;
+    expect(spec).toMatchObject({ kind: 'boolean', effect: 'immediate' });
+    expect(store.coerceConfigValue(spec, 'on')).toEqual({ ok: true, value: true });
+    expect(store.coerceConfigValue(spec, 'off')).toEqual({ ok: true, value: false });
+    expect((await store.applyConfigField('app_default', spec, true)).ok).toBe(true);
+    expect(registry.getBot('app_default').config.senderTagHideEmail).toBe(true);
+    expect(registry.loadBotConfigs()[0].senderTagHideEmail).toBe(true);
+    expect((await store.applyConfigField('app_default', spec, false)).ok).toBe(true);
+    expect(readConfig()).not.toHaveProperty('senderTagHideEmail');
+    expect(registry.loadBotConfigs()[0].senderTagHideEmail).toBeUndefined();
+  });
+
+  it('defaults Codex capacity recovery off and round-trips its explicit opt-in', async () => {
+    const { registry, store } = await loaded({ cliId: 'codex' });
+    expect(registry.getBot('app_default').config.codexCapacityRecovery).not.toBe(true);
+    const spec = store.findConfigField('codexCapacityRecovery')!;
+    expect(spec).toMatchObject({ kind: 'boolean', effect: 'immediate', clearable: true });
+    expect(store.coerceConfigValue(spec, 'on')).toEqual({ ok: true, value: true });
+    expect(store.coerceConfigValue(spec, 'off')).toEqual({ ok: true, value: false });
+    expect(store.coerceConfigValue(spec, 'sometimes').ok).toBe(false);
+    expect((await store.applyConfigField('app_default', spec, true)).ok).toBe(true);
+    expect(readConfig().codexCapacityRecovery).toBe(true);
+    expect(registry.getBot('app_default').config.codexCapacityRecovery).toBe(true);
+    expect(registry.loadBotConfigs()[0].codexCapacityRecovery).toBe(true);
+    expect((await store.applyConfigField('app_default', spec, false)).ok).toBe(true);
+    expect(registry.getBot('app_default').config.codexCapacityRecovery).not.toBe(true);
+    expect(registry.loadBotConfigs()[0].codexCapacityRecovery).not.toBe(true);
+    expect((await store.applyConfigField('app_default', spec, null)).ok).toBe(true);
+    expect(readConfig().codexCapacityRecovery).toBeUndefined();
+    expect(registry.getBot('app_default').config.codexCapacityRecovery).toBeUndefined();
+  });
+
+  it('defaults the delivered-final failure-notice opt-in off and round-trips only an explicit true', async () => {
+    const { registry, store } = await loaded({ cliId: 'codex' });
+    expect(registry.getBot('app_default').config.suppressDeliveredFinalFailureNotice).toBeUndefined();
+    const spec = store.findConfigField('suppressDeliveredFinalFailureNotice')!;
+    expect(spec).toMatchObject({ kind: 'boolean', effect: 'next-session', clearable: true });
+    expect(spec.defaultOn).toBeUndefined();
+    expect(spec.hint).toContain('实验性');
+    expect(spec.hint).toContain('默认 off');
+    expect(store.coerceConfigValue(spec, 'on')).toEqual({ ok: true, value: true });
+    expect(store.coerceConfigValue(spec, 'off')).toEqual({ ok: true, value: false });
+    expect((await store.applyConfigField('app_default', spec, true)).ok).toBe(true);
+    expect(readConfig().suppressDeliveredFinalFailureNotice).toBe(true);
+    expect(registry.getBot('app_default').config.suppressDeliveredFinalFailureNotice).toBe(true);
+    expect(registry.loadBotConfigs()[0].suppressDeliveredFinalFailureNotice).toBe(true);
+    expect((await store.applyConfigField('app_default', spec, false)).ok).toBe(true);
+    expect(readConfig()).not.toHaveProperty('suppressDeliveredFinalFailureNotice');
+    expect(registry.getBot('app_default').config.suppressDeliveredFinalFailureNotice).toBeUndefined();
+    expect((await store.applyConfigField('app_default', spec, null)).ok).toBe(true);
+    expect(readConfig()).not.toHaveProperty('suppressDeliveredFinalFailureNotice');
+  });
+
+  it.each(['true', 1, 'on'])('does not enable the delivered-final opt-in from a non-boolean bots.json value (%s)', async raw => {
+    const { registry } = await loaded({ cliId: 'codex', suppressDeliveredFinalFailureNotice: raw });
+    expect(registry.getBot('app_default').config.suppressDeliveredFinalFailureNotice).toBeUndefined();
+  });
+
+  it('normalizes noProgressNotify JSON and rejects out-of-range or unknown fields', async () => {
+    const { store } = await loaded();
+    const spec = store.findConfigField('noProgressNotify')!;
+    expect(spec).toMatchObject({ kind: 'json', effect: 'immediate', clearable: true });
+    expect(store.coerceConfigValue(spec, '{}')).toEqual({ ok: true, value: { enabled: true } });
+    expect(store.coerceConfigValue(spec, '{"enabled":false}')).toEqual({ ok: true, value: { enabled: false } });
+    expect(store.coerceConfigValue(spec, '{"timeoutMs":300000}')).toEqual({ ok: true, value: { enabled: true, timeoutMs: 300000 } });
+    expect(store.coerceConfigValue(spec, '{"enabled":false,"timeoutMs":300000}')).toEqual({ ok: true, value: { enabled: false, timeoutMs: 300000 } });
+    expect(store.coerceConfigValue(spec, '{"timeoutMs":5000}').ok).toBe(false);
+    expect(store.coerceConfigValue(spec, '{"timeoutMs":3600001}').ok).toBe(false);
+    expect(store.coerceConfigValue(spec, '{"timeoutMs":90.5}').ok).toBe(false);
+    expect(store.coerceConfigValue(spec, '{"enabled":"yes"}').ok).toBe(false);
+    expect(store.coerceConfigValue(spec, '{"unknown":1}').ok).toBe(false);
+  });
+
+  it('persists, cold-loads and clears noProgressNotify through the shared field', async () => {
+    // bots.json hand-edit path: registry load normalizes the raw entry.
+    const { registry, store } = await loaded({ noProgressNotify: { timeoutMs: 300000 } });
+    expect(registry.getBot('app_default').config.noProgressNotify).toEqual({ enabled: true, timeoutMs: 300000 });
+
+    // /config set path: mute lands in the registry + on disk in one round-trip.
+    const spec = store.findConfigField('noProgressNotify')!;
+    const applied = await store.applyConfigField('app_default', spec, { enabled: false, timeoutMs: 300000 });
+    expect(applied).toMatchObject({ ok: true, effect: 'immediate' });
+    expect(registry.getBot('app_default').config.noProgressNotify).toEqual({ enabled: false, timeoutMs: 300000 });
+    expect(readConfig().noProgressNotify).toEqual({ enabled: false, timeoutMs: 300000 });
+
+    // Cold reload keeps the value (hand-edited bots.json with same content).
+    const cold = await freshModules();
+    cold.registry.loadBotConfigs().forEach((c: any) => cold.registry.registerBot(c));
+    expect(cold.registry.getBot('app_default').config.noProgressNotify).toEqual({ enabled: false, timeoutMs: 300000 });
+
+    // unset clears back to the built-in default (enabled, 90s).
+    const cleared = await store.applyConfigField('app_default', spec, null);
+    expect(cleared).toMatchObject({ ok: true });
+    expect(registry.getBot('app_default').config.noProgressNotify).toBeUndefined();
+    expect(readConfig().noProgressNotify).toBeUndefined();
+  });
+
+  it('keeps CLI progress notices and prompt-cache configuration independent across reload and unset', async () => {
+    const { store } = await loaded();
+    const noticeSpec = store.findConfigField('noProgressNotify')!;
+    const cacheSpec = store.findConfigField('promptCache')!;
+    const notice = { enabled: true, cliEnabled: true, timeoutMs: 300000 };
+    const cache = { ttl: '1h', keepalive: { enabled: true, maxPings: 2 } };
+    for (const [spec, value] of [[noticeSpec, notice], [cacheSpec, cache]] as const) {
+      const parsed = store.coerceConfigValue(spec, JSON.stringify(value));
+      expect(parsed).toEqual({ ok: true, value });
+      if (!parsed.ok) throw new Error(parsed.reason);
+      expect(await store.applyConfigField('app_default', spec, parsed.value)).toMatchObject({ ok: true });
+    }
+    expect(readConfig()).toMatchObject({ noProgressNotify: notice, promptCache: cache });
+    const cold = await freshModules();
+    cold.registry.loadBotConfigs().forEach((c: any) => cold.registry.registerBot(c));
+    expect(cold.registry.getBot('app_default').config).toMatchObject({ noProgressNotify: notice, promptCache: cache });
+    expect(await cold.store.applyConfigField('app_default', cold.store.findConfigField('promptCache')!, null)).toMatchObject({ ok: true });
+    expect(readConfig().promptCache).toBeUndefined();
+    expect(readConfig().noProgressNotify).toEqual(notice);
+    expect(await cold.store.applyConfigField('app_default', cold.store.findConfigField('promptCache')!, cache)).toMatchObject({ ok: true });
+    expect(await cold.store.applyConfigField('app_default', cold.store.findConfigField('noProgressNotify')!, null)).toMatchObject({ ok: true });
+    expect(readConfig().noProgressNotify).toBeUndefined();
+    expect(readConfig().promptCache).toEqual(cache);
   });
 
   it('validates, persists, cold-loads and clears opt-in /g defaults', async () => {
@@ -511,6 +848,24 @@ describe('bot-config store', () => {
     expect(registry.getBot('app_default').config.env).toBeUndefined();
   });
 
+  it('merges dashboard env saves inside the file lock so concurrent merge/remove keep both changes', async () => {
+    const { registry, store } = await loaded({ env: { A: '1' } });
+    // Both requests start from the same stale snapshot {A}; computing the merge
+    // outside the lock would let the remove drop B (or the add resurrect A).
+    const [r1, r2] = await Promise.all([
+      store.applyPerBotEnvChange('app_default', { incoming: {}, mode: 'merge', remove: ['A'] }),
+      store.applyPerBotEnvChange('app_default', { incoming: { B: '2' }, mode: 'merge' }),
+    ]);
+    expect(r1.ok && r2.ok).toBe(true);
+    expect(readConfig().env).toEqual({ B: '2' });
+    expect(registry.getBot('app_default').config.env).toEqual({ B: '2' });
+
+    const r3 = await store.applyPerBotEnvChange('app_default', { incoming: {}, mode: 'replace' });
+    expect(r3).toEqual({ ok: true, envKeys: [] });
+    expect(readConfig().env).toBeUndefined();
+    expect(registry.getBot('app_default').config.env).toBeUndefined();
+  });
+
   it('rejects reserved env keys (BOTMUX_*/GROK_HOME/CODEX_HOME) instead of silent drop', async () => {
     const { store } = await loaded();
     const spec = store.findConfigField('env')!;
@@ -534,6 +889,17 @@ describe('bot-config store', () => {
 
     // Reserved-only object also fails as reserved_env (not invalid_json).
     expect(store.coerceConfigValue(spec, '{"BOTMUX_X":"y"}')).toEqual({ ok: false, reason: 'reserved_env' });
+    // Same rule for dotenv input — CLAUDE_CONFIG_DIR from a launcher script is refused.
+    expect(store.coerceConfigValue(spec, 'CLAUDE_CONFIG_DIR=/x\nANTHROPIC_MODEL=m')).toEqual({ ok: false, reason: 'reserved_env' });
+  });
+
+  it('accepts dotenv / settings-snippet env text and normalizes to the same map as JSON', async () => {
+    const { store } = await loaded();
+    const spec = store.findConfigField('env')!;
+    const want = { ok: true, value: { ANTHROPIC_BASE_URL: 'http://gw:8080', ANTHROPIC_MODEL: 'claude-opus-5-5' } };
+    expect(store.coerceConfigValue(spec, 'ANTHROPIC_BASE_URL=http://gw:8080\nexport ANTHROPIC_MODEL="claude-opus-5-5"')).toEqual(want);
+    expect(store.coerceConfigValue(spec, '{"env":{"ANTHROPIC_BASE_URL":"http://gw:8080","ANTHROPIC_MODEL":"claude-opus-5-5"}}')).toEqual(want);
+    expect(store.coerceConfigValue(spec, 'A="unterminated')).toEqual({ ok: false, reason: 'invalid_env' });
   });
 
   it('boolean field writes true / deletes key on false (keeps bots.json tidy)', async () => {
@@ -554,6 +920,45 @@ describe('bot-config store', () => {
     expect(registry.loadBotConfigs()[0].showReplyTiming).toBe(true);
     await store.applyConfigField('app_default', timing, false);
     expect(readConfig().showReplyTiming).toBeUndefined();
+  });
+
+  it('larkToolBinding is a next-session clearable boolean with defaultOn, aliases bindlarkapp / larkappbinding, and cleans bots.json when true', async () => {
+    const { registry, store } = await loaded();
+    expect(store.findConfigField('larkToolBinding')?.configKey).toBe('larkToolBinding');
+    expect(store.findConfigField('bindLarkApp')?.configKey).toBe('larkToolBinding');
+    expect(store.findConfigField('larkAppBinding')?.configKey).toBe('larkToolBinding');
+
+    const spec = store.findConfigField('larkToolBinding')!;
+    expect(spec.effect).toBe('next-session');
+    expect(spec.clearable).toBe(true);
+    expect(spec.defaultOn).toBe(true);
+
+    // Initial state: undefined (renders 'on' because defaultOn: true)
+    expect(registry.getBot('app_default').config.larkToolBinding).toBeUndefined();
+    expect(readConfig().larkToolBinding).toBeUndefined();
+
+    // Disable (false) -> writes false on disk and in memory
+    const r1 = await store.applyConfigField('app_default', spec, false);
+    expect(r1.ok).toBe(true);
+    if (r1.ok) { expect(r1.oldText).toBe('on'); expect(r1.newText).toBe('off'); }
+    expect(readConfig().larkToolBinding).toBe(false);
+    expect(registry.getBot('app_default').config.larkToolBinding).toBe(false);
+
+    // Enable (true) -> deletes key (back to default), in-memory undefined (= on)
+    const r2 = await store.applyConfigField('app_default', spec, true);
+    expect(r2.ok).toBe(true);
+    if (r2.ok) { expect(r2.oldText).toBe('off'); expect(r2.newText).toBe('on'); }
+    expect(readConfig().larkToolBinding).toBeUndefined();
+    expect(registry.getBot('app_default').config.larkToolBinding).toBeUndefined();
+
+    // Unset (null) from an explicit-false state also restores the default
+    await store.applyConfigField('app_default', spec, false);
+    expect(readConfig().larkToolBinding).toBe(false);
+    const r3 = await store.applyConfigField('app_default', spec, null);
+    expect(r3.ok).toBe(true);
+    if (r3.ok) expect(r3.newText).toBe('on');
+    expect(readConfig().larkToolBinding).toBeUndefined();
+    expect(registry.getBot('app_default').config.larkToolBinding).toBeUndefined();
   });
 
   it('sets and unsets hidden streaming-card buttons through /botconfig', async () => {
@@ -983,6 +1388,72 @@ describe('bot-config store', () => {
     expect(registry.getBot('app_default').config.reasoningEffort).toBe('xhigh');
   });
 
+  it('serviceTier is a codex-only next-session enum field', async () => {
+    const { registry, store } = await loaded({ cliId: 'codex' });
+    const spec = store.findConfigField('serviceTier')!;
+    expect(spec.kind).toBe('enum');
+    expect(spec.effect).toBe('next-session');
+    expect(store.coerceConfigValue(spec, 'PRIORITY')).toEqual({ ok: true, value: 'priority' });
+    expect(store.coerceConfigValue(spec, 'fast')).toEqual({ ok: false, reason: 'invalid_enum' });
+
+    const explicitDefault = await store.applyConfigField('app_default', spec, 'default');
+    expect(explicitDefault.ok).toBe(true);
+    expect(readConfig().serviceTier).toBe('default');
+    expect(registry.getBot('app_default').config.serviceTier).toBe('default');
+
+    const cleared = await store.applyConfigField('app_default', spec, null);
+    expect(cleared.ok).toBe(true);
+    expect(readConfig().serviceTier).toBeUndefined();
+    expect(registry.getBot('app_default').config.serviceTier).toBeUndefined();
+  });
+
+  it('validates accelerated serviceTier against the actual model catalog', async () => {
+    const { registry, store } = await loaded({ cliId: 'codex', model: 'gpt-6.1-sol' });
+    const spec = store.findConfigField('serviceTier')!;
+    vi.mocked(validateCodexServiceTier).mockResolvedValueOnce({ ok: false, error: 'not_supported_by_model' });
+    const rejected = await store.applyConfigField('app_default', spec, 'ultrafast');
+    expect(rejected).toEqual({ ok: false, reason: 'service_tier_not_supported_by_model' });
+    expect(validateCodexServiceTier).toHaveBeenCalledWith(expect.objectContaining({
+      model: 'gpt-6.1-sol',
+      serviceTier: 'ultrafast',
+    }));
+    expect(readConfig().serviceTier).toBeUndefined();
+    expect(registry.getBot('app_default').config.serviceTier).toBeUndefined();
+
+    const saved = await store.applyConfigField('app_default', spec, 'priority');
+    expect(saved.ok).toBe(true);
+    expect(readConfig().serviceTier).toBe('priority');
+  });
+
+  it('rejects accelerated serviceTier without a model and rechecks when model changes', async () => {
+    const { store } = await loaded({ cliId: 'codex', model: 'gpt-6.1-sol', serviceTier: 'priority' });
+    const tierSpec = store.findConfigField('serviceTier')!;
+    vi.mocked(validateCodexServiceTier).mockResolvedValueOnce({ ok: false, error: 'model_required' });
+    const rejected = await store.applyConfigField('app_default', tierSpec, 'priority');
+    expect(rejected).toEqual({ ok: false, reason: 'service_tier_model_required' });
+
+    const modelSpec = store.findConfigField('model')!;
+    vi.mocked(validateCodexServiceTier).mockResolvedValueOnce({ ok: false, error: 'catalog_unavailable' });
+    const changedModel = await store.applyConfigField('app_default', modelSpec, 'gpt-6-astra');
+    expect(changedModel).toEqual({ ok: false, reason: 'service_tier_catalog_unavailable' });
+  });
+
+  it('rejects serviceTier writes for unsupported CLIs and clears it when switching CLI', async () => {
+    const unsupported = await loaded({ cliId: 'gemini' });
+    const spec = unsupported.store.findConfigField('serviceTier')!;
+    const rejected = await unsupported.store.applyConfigField('app_default', spec, 'priority');
+    expect(rejected.ok).toBe(false);
+    if (!rejected.ok) expect(rejected.reason).toBe('service_tier_not_supported');
+    expect(readConfig().serviceTier).toBeUndefined();
+
+    const switched = await loaded({ cliId: 'codex', serviceTier: 'ultrafast' });
+    const cliSpec = switched.store.findConfigField('cli')!;
+    const switchedCli = await switched.store.applyConfigField('app_default', cliSpec, 'claude-code');
+    expect(switchedCli.ok).toBe(true);
+    expect(readConfig().serviceTier).toBeUndefined();
+    expect(switched.registry.getBot('app_default').config.serviceTier).toBeUndefined();
+  });
+
   it('replyDelivery: defaults to send on every CLI; both values persist; unset clears back to that default', async () => {
     const { registry, store } = await loaded({ cliId: 'claude-code' });
     const spec = store.findConfigField('replyDelivery')!;
@@ -1054,7 +1525,10 @@ describe('bot-config store', () => {
   });
 
   it('rejects replyDelivery=transcript for CLIs without transcript capture', async () => {
-    const { registry, store } = await loaded({ cliId: 'cursor' });
+    // antigravity has only zero-prompt transcript harvest and is still
+    // unsupported for ordinary transcript delivery; cursor used to be the
+    // exemplar here but gained the capability in #932.
+    const { registry, store } = await loaded({ cliId: 'antigravity' });
     const spec = store.findConfigField('replyDelivery')!;
     const before = store.getConfigSnapshot('app_default');
     expect(before.ok && before.rows.find(r => r.key === 'replyDelivery')?.value).toBe('send');
@@ -1069,6 +1543,64 @@ describe('bot-config store', () => {
     expect(r2.ok).toBe(true);
     expect(readConfig().replyDelivery).toBe('send');
     expect(registry.resolveReplyDelivery('app_default')).toBe('send');
+  });
+
+  it('accepts replyDelivery=transcript for cursor (always-on structured fallback since #932)', async () => {
+    const { registry, store } = await loaded({ cliId: 'cursor' });
+    const spec = store.findConfigField('replyDelivery')!;
+    const r = await store.applyConfigField('app_default', spec, 'transcript');
+    expect(r.ok).toBe(true);
+    expect(readConfig().replyDelivery).toBe('transcript');
+    expect(registry.resolveReplyDelivery('app_default')).toBe('transcript');
+  });
+
+  it('rejects replyDelivery=transcript for cursor under scratch sandbox (host cannot read merged mirror; never a silent fallback)', async () => {
+    const { store } = await loaded({ cliId: 'cursor', sandbox: 'scratch' });
+    const spec = store.findConfigField('replyDelivery')!;
+    const r = await store.applyConfigField('app_default', spec, 'transcript');
+    expect(r.ok).toBe(false);
+    expect(r.reason).toBe('reply_delivery_unsupported');
+    expect(readConfig().replyDelivery).toBeUndefined();
+  });
+
+  it('still accepts replyDelivery=transcript for an always-on non-cursor CLI (codex) under scratch — its bridge does not read a merged mirror', async () => {
+    const { store } = await loaded({ cliId: 'codex', sandbox: 'scratch' });
+    const spec = store.findConfigField('replyDelivery')!;
+    const r = await store.applyConfigField('app_default', spec, 'transcript');
+    expect(r.ok).toBe(true);
+    expect(readConfig().replyDelivery).toBe('transcript');
+  });
+
+  it('invariant backstop: switching cliId codex→cursor while scratch+transcript persist is rejected (the replyDelivery-only gate misses this edge)', async () => {
+    // 复现 pi 复审洞 1：replyDelivery 写入门禁只在 configKey==='replyDelivery' 时跑，
+    // 单查那条边会放行进 cursor 的切换，落盘永久无效组合（dashboard 显「已开启」、
+    // 运行时静默回落 send）。rmwBotEntry 的全局不变量必须在 cli 切换这条边拦下。
+    const { store } = await loaded({ cliId: 'codex', sandbox: 'scratch', replyDelivery: 'transcript' });
+    const spec = store.findConfigField('cli')!;
+    const r = await store.applyConfigField('app_default', spec, 'cursor');
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.reason).toBe('reply_delivery_unsupported');
+    expect(readConfig()).toMatchObject({ cliId: 'codex', sandbox: 'scratch', replyDelivery: 'transcript' });
+  });
+
+  it('repair path: switching the invalid cursor+scratch+transcript entry to a supporting CLI (codex) succeeds', async () => {
+    // 不能把坏 entry 锁死：任何一个字段改到合法组合都必须能写，给运维修复出口。
+    const { store } = await loaded({ cliId: 'cursor', sandbox: 'scratch', replyDelivery: 'transcript' });
+    const spec = store.findConfigField('cli')!;
+    const r = await store.applyConfigField('app_default', spec, 'codex');
+    expect(r.ok).toBe(true);
+    expect(readConfig()).toMatchObject({ cliId: 'codex', sandbox: 'scratch', replyDelivery: 'transcript' });
+  });
+
+  it('invariant backstop: updateBotSandboxMode rejects switching a cursor+transcript bot to scratch (rmwBotEntry path, no replyDelivery write)', async () => {
+    const { registry } = await loaded({ cliId: 'cursor', replyDelivery: 'transcript' });
+    const sandboxStore = await import('../src/services/sandbox-store.js');
+    const r = await sandboxStore.updateBotSandboxMode('app_default', 'scratch');
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.reason).toBe('reply_delivery_unsupported');
+    expect(readConfig().sandbox).toBeUndefined();
+    // 内存态可能由配置归一化填默认 false（盘上缺省才是契约）；关键是不能落成 scratch。
+    expect(registry.getBot('app_default').config.sandbox).not.toBe('scratch');
   });
 
   it('stringList (customPassthroughCommands) coerces, dedupes, drops daemon-shadowing + junk', async () => {
@@ -1183,6 +1715,67 @@ describe('bot-config store', () => {
     const r = await store.setBotAllowedUsers('app_default', ['garbage'], 'ou_owner');
     expect(r.ok).toBe(false);
     if (!r.ok) expect(r.reason).toBe('empty_resolved');
+  });
+
+  // 确定性解析失败（邮箱不存在 / 对本应用不可见）不拒绝写入：条目可能只是临时
+  // 不可见，且 self-lockout 防护已保证发起人仍生效。但结果必须把未生效条目带
+  // 回给 /botconfig 提示，而不是让它静默消失。
+  it('setBotAllowedUsers keeps writing but reports a definitively-missing email in unresolvedEmailsAndMobiles', async () => {
+    const { store } = await loaded();
+    const r = await store.setBotAllowedUsers(
+      'app_default', ['alice@corp.com', 'ghost@corp.com'], 'ou_alice',
+    );
+    expect(r.ok).toBe(true);
+    if (!r.ok) throw new Error('expected ok');
+    expect(r.resolved).toEqual(['ou_alice']);
+    expect(r.unresolvedEmailsAndMobiles).toEqual(['ghost@corp.com']);
+    // 原始条目照常落盘，日后联系人可见时可随重新解析恢复。
+    expect(readConfig().allowedUsers).toEqual(['alice@corp.com', 'ghost@corp.com']);
+  });
+
+  it('setBotAllowedUsers reports a definitively-missing mobile alongside a resolved one', async () => {
+    const { store } = await loaded();
+    // 测试桩里非邮箱、非 ou_/on_ 的条目一律按 definitive miss（手机号同样走
+    // 真实 resolver 的 batch 缺口径）。
+    const r = await store.setBotAllowedUsers(
+      'app_default', ['alice@corp.com', '13900000000'], 'ou_alice',
+    );
+    expect(r.ok).toBe(true);
+    if (r.ok) expect(r.unresolvedEmailsAndMobiles).toEqual(['13900000000']);
+  });
+
+  it('setBotAllowedUsers dedupes repeated definitively-missing entries in the warning list', async () => {
+    const { store } = await loaded();
+    // 同一条失效邮箱在命令里写两次：原始条目照常落盘（不去重用户输入），
+    // 但给 /botconfig 的未生效提示只列一次，与 union_id 告警口径一致。
+    const r = await store.setBotAllowedUsers(
+      'app_default', ['alice@corp.com', 'ghost@corp.com', 'ghost@corp.com'], 'ou_alice',
+    );
+    expect(r.ok).toBe(true);
+    if (!r.ok) throw new Error('expected ok');
+    expect(r.unresolvedEmailsAndMobiles).toEqual(['ghost@corp.com']);
+  });
+
+  it('setBotAllowedUsers omits warning fields when every entry resolves', async () => {    const { store } = await loaded();
+    const r = await store.setBotAllowedUsers('app_default', ['alice@corp.com', 'ou_owner'], 'ou_alice');
+    expect(r.ok).toBe(true);
+    if (r.ok) {
+      expect(r.unresolvedEmailsAndMobiles).toBeUndefined();
+      expect(r.unresolvedUnionIds).toBeUndefined();
+    }
+  });
+
+  it('setBotAllowedUsers reports on_ misses only in unresolvedUnionIds, not as email/mobile warnings', async () => {
+    const { store } = await loaded();
+    // 正常 on_ 与邮箱确定性 miss 同时存在：两类告警互不串台（on_ miss 的分支
+    // 由 config-allow-owner-identity.test.ts 覆盖）。
+    const r = await store.setBotAllowedUsers(
+      'app_default', ['on_buddy', 'ghost@corp.com'], 'ou_buddy',
+    );
+    expect(r.ok).toBe(true);
+    if (!r.ok) throw new Error('expected ok');
+    expect(r.unresolvedUnionIds).toBeUndefined();
+    expect(r.unresolvedEmailsAndMobiles).toEqual(['ghost@corp.com']);
   });
 
   it('setBotBlockedUsers with [] clears disk entry and in-memory resolved list', async () => {
@@ -1384,5 +1977,81 @@ describe('bot-config store', () => {
     const r = await store.applyConfigField('app_missing', spec, 'x');
     expect(r.ok).toBe(false);
     if (!r.ok) expect(r.reason).toBe('bot_not_registered');
+  });
+});
+
+describe('codexProfile cross-field gate across generic write surfaces (#2037)', () => {
+  beforeEach(() => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-profile-gate-'));
+    process.env.BOTS_CONFIG = join(dir, 'bots.json');
+    process.env.SESSION_DATA_DIR = dir;
+  });
+  afterEach(() => { delete process.env.BOTS_CONFIG; delete process.env.SESSION_DATA_DIR; });
+
+  async function setupRegistry() {
+    const { registry, store } = await freshModules();
+    registry.loadBotConfigs().forEach((c: any) => registry.registerBot(c));
+    return { registry, store };
+  }
+  const profileBotJson = () => JSON.stringify([{
+    larkAppId: 'app_default', larkAppSecret: 'secret', cliId: 'codex', codexProfile: 'selected',
+  }]);
+
+  it.each([
+    ['startupCommands', ['/effort low']],
+    ['codexAuthSync', 'isolated'],
+    ['backendType', 'zellij'],
+  ] as const)('rejects %s from a generic /config write when a codexProfile is set', async (key, value) => {
+    writeFileSync(process.env.BOTS_CONFIG!, profileBotJson());
+    const { registry, store } = await setupRegistry();
+    const before = readFileSync(process.env.BOTS_CONFIG!, 'utf8');
+    const r = await store.applyConfigField('app_default', store.findConfigField(key)!, value);
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.reason).toContain('Codex profile');
+    expect(readFileSync(process.env.BOTS_CONFIG!, 'utf8')).toBe(before);
+    const onDisk = JSON.parse(readFileSync(process.env.BOTS_CONFIG!, 'utf8'))[0];
+    expect(onDisk[key]).toBeUndefined();
+    expect(registry.getBot('app_default').config.codexProfile).toBe('selected');
+  });
+
+  it('rejects a non-default service tier through the generic path while keeping the profile', async () => {
+    writeFileSync(process.env.BOTS_CONFIG!, profileBotJson());
+    const { store } = await setupRegistry();
+    const r = await store.applyConfigField('app_default', store.findConfigField('serviceTier')!, 'priority');
+    expect(r.ok).toBe(false);
+    expect(JSON.parse(readFileSync(process.env.BOTS_CONFIG!, 'utf8'))[0])
+      .toMatchObject({ cliId: 'codex', codexProfile: 'selected' });
+  });
+
+  it('still accepts an unrelated field (model) for a profile bot', async () => {
+    writeFileSync(process.env.BOTS_CONFIG!, profileBotJson());
+    const { store } = await setupRegistry();
+    const r = await store.applyConfigField('app_default', store.findConfigField('model')!, 'gpt-test');
+    expect(r.ok).toBe(true);
+    expect(JSON.parse(readFileSync(process.env.BOTS_CONFIG!, 'utf8'))[0])
+      .toMatchObject({ codexProfile: 'selected', model: 'gpt-test' });
+  });
+
+  it('does not affect bots without a profile: startupCommands still writes', async () => {
+    writeFileSync(process.env.BOTS_CONFIG!, JSON.stringify([{
+      larkAppId: 'app_default', larkAppSecret: 'secret', cliId: 'codex',
+    }]));
+    const { store } = await setupRegistry();
+    const r = await store.applyConfigField('app_default', store.findConfigField('startupCommands')!, ['/effort low']);
+    expect(r.ok).toBe(true);
+    expect(JSON.parse(readFileSync(process.env.BOTS_CONFIG!, 'utf8'))[0].startupCommands)
+      .toEqual(['/effort low']);
+  });
+
+  it('writeRawConfigAtomic refuses a whole generation the loader would reject, leaving the file intact', async () => {
+    const { writeRawConfigAtomic, readRawConfig } = await import('../src/services/config-store.js');
+    const path = process.env.BOTS_CONFIG!;
+    writeFileSync(path, profileBotJson());
+    const before = readFileSync(path, 'utf8');
+    const bad = JSON.parse(before);
+    bad[0].readIsolation = true;
+    await expect(writeRawConfigAtomic(path, bad)).rejects.toThrow('Codex profile');
+    expect(readFileSync(path, 'utf8')).toBe(before);
+    expect((await readRawConfig(path))[0].readIsolation).toBeUndefined();
   });
 });

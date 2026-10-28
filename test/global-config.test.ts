@@ -26,14 +26,44 @@ describe('global dashboard config', () => {
   beforeEach(() => {
     home = mkdtempSync(join(tmpdir(), 'botmux-global-config-'));
     vi.stubEnv('HOME', home);
+    vi.stubEnv('USERPROFILE', home);
+    vi.stubEnv('BOTMUX_GLOBAL_CONFIG_FILE', join(home, 'config.json'));
+    vi.stubEnv('BOTS_CONFIG', join(home, 'bots.json'));
     vi.stubEnv('BOTMUX_WORKFLOW_ENABLED', '');
     vi.stubEnv('BOTMUX_MULTI_TOPIC_ENABLED', '');
     mkdirSync(dirname(globalConfigPath()), { recursive: true });
   });
 
+  it.each([
+    [{ volcengine: null }, { volcengine: null }],
+    [{ volcengine: { mode: 'typo' }, asr: { enabled: true } }, { volcengine: null, asr: { enabled: true } }],
+    [{ engine: 'volcengine', volcengine: { mode: 'agent-plan', apiKey: ' P ' } },
+      { engine: 'volcengine', volcengine: { mode: 'agent-plan', apiKey: 'P' } }],
+    [{ volcengine: { apiKey: '' } }, { volcengine: { apiKey: '' } }],
+    [{ rate: 1.2 }, { rate: 1.2 }],
+    [{ speaker: 'custom' }, { speaker: 'custom' }],
+  ])('retains Volcengine denial and scalar overrides on disk, row %#', (voice, expected) => {
+    writeFileSync(globalConfigPath(), JSON.stringify({ voice }));
+    invalidateGlobalConfigCache();
+    expect(readGlobalConfig().voice).toEqual(expected);
+  });
+
   afterEach(() => {
     vi.unstubAllEnvs();
     rmSync(home, { recursive: true, force: true });
+  });
+
+  it('keeps unrelated settings and the kill switch when meeting policy is malformed', () => {
+    writeFileSync(globalConfigPath(), JSON.stringify({ lang: 'zh', vcMeetingAgent: { enabled: false, listenerPolicy: { rawMessages: 'false' } } }));
+    invalidateGlobalConfigCache();
+    expect(readGlobalConfig().vcMeetingAgent).toEqual({ enabled: false, listenerPolicy: { rawMessages: false, finalSummary: false, allowSummarySharing: false } });
+  });
+
+  it('round-trips global meeting listener defaults without changing consumer selection', () => {
+    const listenerPolicy = { rawMessages: false, finalSummary: true, allowSummarySharing: true };
+    writeFileSync(globalConfigPath(), JSON.stringify({ vcMeetingAgent: { enabled: true, listenerPolicy } }));
+    invalidateGlobalConfigCache();
+    expect(readGlobalConfig().vcMeetingAgent).toEqual({ enabled: true, listenerPolicy });
   });
 
   it('reads only boolean dashboard settings', () => {
@@ -51,6 +81,27 @@ describe('global dashboard config', () => {
       enableLocalCliOpen: true,
       localCliOpenMode: 'resume',
     });
+  });
+
+  it('uses an absolute operator-provided global config path', () => {
+    const shared = join(home, 'control', 'config.json');
+    mkdirSync(dirname(shared), { recursive: true });
+    vi.stubEnv('BOTMUX_GLOBAL_CONFIG_FILE', shared);
+    writeFileSync(shared, JSON.stringify({ repoPickerMode: 'repos' }));
+    invalidateGlobalConfigCache();
+    expect(globalConfigPath()).toBe(shared);
+    expect(readGlobalConfig().repoPickerMode).toBe('repos');
+  });
+
+  it('rejects a relative operator-provided global config path', () => {
+    vi.stubEnv('BOTMUX_GLOBAL_CONFIG_FILE', 'control/config.json');
+    expect(() => globalConfigPath()).toThrow(/must be absolute/);
+  });
+
+  it('rejects an uncoordinated global config write in primary mode', () => {
+    vi.stubEnv('BOTMUX_COORDINATION_MODE', 'primary');
+    expect(() => mergeGlobalConfig({ repoPickerMode: 'repos' }))
+      .toThrow('durable_config_coordinator_required');
   });
 
   it('drops invalid dashboard.localCliOpenMode values', () => {
@@ -134,18 +185,6 @@ describe('global dashboard config', () => {
       enabled: true,
       source: 'owner/repo/subdir',
       ref: 'reviewed-sha',
-    });
-  });
-
-  it('reads the review-only legacy spec as source/ref for compatibility', () => {
-    writeFileSync(globalConfigPath(), JSON.stringify({
-      dashboard: { herdrTraexPlugin: { enabled: true, spec: ' owner/repo#tag ' } },
-    }));
-
-    expect(readGlobalConfig().dashboard?.herdrTraexPlugin).toEqual({
-      enabled: true,
-      source: 'owner/repo',
-      ref: 'tag',
     });
   });
 
@@ -476,6 +515,14 @@ describe('global dashboard config', () => {
     expect(readGlobalConfig().plugins).toEqual(['agent-chrome', 'gitlab']);
   });
 
+  it('reads a valid MCP Gateway timeout ceiling and drops unsafe values', () => {
+    writeFileSync(globalConfigPath(), JSON.stringify({ mcpGatewayMaxToolTimeoutMs: 900_000 }));
+    expect(readGlobalConfig().mcpGatewayMaxToolTimeoutMs).toBe(900_000);
+    invalidateGlobalConfigCache();
+    writeFileSync(globalConfigPath(), JSON.stringify({ mcpGatewayMaxToolTimeoutMs: 2_147_483_648 }));
+    expect(readGlobalConfig().mcpGatewayMaxToolTimeoutMs).toBeUndefined();
+  });
+
   it('readGlobalConfig sees fresh values immediately after a merge (cache invalidation)', () => {
     writeFileSync(globalConfigPath(), JSON.stringify({ dashboard: { publicReadOnly: true } }));
     expect(readGlobalConfig().dashboard?.publicReadOnly).toBe(true); // primes the TTL cache
@@ -484,9 +531,9 @@ describe('global dashboard config', () => {
     expect(readGlobalConfig().dashboard?.publicReadOnly).toBe(false);
   });
 
-  it('httpProxy survives a merge→read roundtrip (HD2D office download proxy)', () => {
-    // Regression: readGlobalConfig() used to drop httpProxy, so the office-tab
-    // proxy persisted by mergeGlobalConfig was never read back by the downloader.
+  it('httpProxy survives a merge→read roundtrip (binary self-update download proxy)', () => {
+    // Regression: readGlobalConfig() used to drop httpProxy, so a proxy persisted
+    // by mergeGlobalConfig was never read back by the downloader.
     expect(readGlobalConfig().httpProxy).toBeUndefined();
     mergeGlobalConfig({ httpProxy: 'http://127.0.0.1:7890' });
     expect(readGlobalConfig().httpProxy).toBe('http://127.0.0.1:7890');
@@ -574,6 +621,14 @@ describe('global sessionCleanup config', () => {
   afterEach(() => {
     vi.unstubAllEnvs();
     rmSync(home, { recursive: true, force: true });
+  });
+
+  it('strictly reads the opt-in Codex archive flag', () => {
+    writeFileSync(globalConfigPath(), JSON.stringify({ sessionCleanup: { archiveCodex: true } }));
+    expect(readGlobalConfig().sessionCleanup).toEqual({ archiveCodex: true });
+    writeFileSync(globalConfigPath(), JSON.stringify({ sessionCleanup: { archiveCodex: 'true' } }));
+    invalidateGlobalConfigCache();
+    expect(readGlobalConfig().sessionCleanup).toBeUndefined();
   });
 
   it('reads a full sessionCleanup block', () => {

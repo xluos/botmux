@@ -96,6 +96,7 @@ vi.mock('../src/core/worker-pool.js', () => ({
   buildStreamingCardJson: vi.fn(() => '{"elements":[]}'),
   silentIdleCardFlag: vi.fn(() => false),
   idleCardLabel: vi.fn(() => undefined),
+  streamCardLabel: vi.fn(() => undefined),
   dshRuntimeForSession: vi.fn(() => undefined),
 }));
 
@@ -146,8 +147,7 @@ import { canOperate } from '../src/im/lark/event-dispatcher.js';
 import { getBot } from '../src/bot-registry.js';
 import { sessionKey, sessionAnchorId, type DaemonSession } from '../src/core/types.js';
 import type { Session } from '../src/types.js';
-import { readFileSync } from 'node:fs';
-import { resolve } from 'node:path';
+import { sensitiveCardActionMeta } from '../src/im/lark/card-action-routes.js';
 
 const LARK_APP_ID = 'cli_app_1';
 const OWNER = 'ou_owner_user';
@@ -335,6 +335,31 @@ describe('compact_session card action', () => {
     expect(result.toast.content).toContain('/compact');
   });
 
+  it('keeps the thread root as the reply root for a thread-scope session', async () => {
+    const ds = makeDs();
+    const deliver = vi.fn();
+    await handleCardAction(actionData('compact_session'), depsWith(ds, deliver), LARK_APP_ID);
+    expect(deliver.mock.calls[0][2].replyRootId).toBe(ROOT);
+  });
+
+  it('does not pass the chat id as a reply root for a chat-scope session', async () => {
+    // Chat-scope cards carry the chat id as root_id; treating it as a thread
+    // root froze an unreplyable target for every later rootless post.
+    const ds = makeDs({ scope: 'chat', sessionOverrides: { scope: 'chat', rootMessageId: 'om_first' } });
+    const deliver = vi.fn();
+    const deps = depsWith(undefined, deliver);
+    deps.activeSessions.set(sessionKey('oc_chat', LARK_APP_ID), ds);
+    const data = actionData('compact_session');
+    data.action.value.root_id = 'oc_chat';
+    const result = await handleCardAction(data, deps, LARK_APP_ID);
+
+    expect(result.toast.type).toBe('success');
+    expect(deliver).toHaveBeenCalledTimes(1);
+    const opts = deliver.mock.calls[0][2];
+    expect(opts.anchor).toBe('oc_chat');
+    expect(opts.replyRootId).toBeUndefined();
+  });
+
   it('falls back to an unsupported toast when the daemon did not wire the dep', async () => {
     const ds = makeDs();
     const result = await handleCardAction(actionData('compact_session'), depsWith(ds, undefined), LARK_APP_ID);
@@ -365,7 +390,7 @@ describe('compact_session card action', () => {
   // mira/mir 把它当**普通用户消息**发给模型白烧一个 turn。router
   // （resolvePassthroughCommands）对这些 CLI 返回空集，handler 也必须拒——否则
   // 卡片侧闸门一旦再漏，这条路又会被打开（本次缺陷正是这么发生的）。
-  it.each(['mira', 'mir', 'dsh', 'ebsd', 'codex-app'])(
+  it.each(['mira', 'mir', 'dsh', 'ebsd', 'codex-app', 'minimax'])(
     'refuses for %s (no raw passthrough surface) instead of writing a literal /compact',
     async (cliId) => {
       const ds = makeDs({ sessionOverrides: { cliId } as any });
@@ -402,16 +427,15 @@ describe('compact_session card action', () => {
   });
 });
 
-// ─── isSensitive source lock ──────────────────────────────────────────────
+// ─── sensitive-action table lock ───────────────────────────────────────────
 
-describe('stop_turn / compact_session permission gate (source lock)', () => {
-  it('both actions are registered in the isSensitive canOperate gate', () => {
+describe('stop_turn / compact_session permission gate (table lock)', () => {
+  it('both actions are registered in the canOperate gate table', () => {
     // 防止后续重构把两个新 action 误移出权限闸（与 term_action/close 同档）。
-    const source = readFileSync(resolve('src/im/lark/card-handler.ts'), 'utf8');
-    const line = source.split('\n').find(l => l.includes('const isSensitive ='));
-    expect(line).toBeTruthy();
-    expect(line!).toContain('stop_turn');
-    expect(line!).toContain('compact_session');
+    // 清单原先是 card-handler.ts 里 `const isSensitive = …` 的手写数组、靠 grep 源码行锁住；
+    // 现在登记在 SENSITIVE_CARD_ACTIONS，直接断言表本身（行为侧的拒绝用例在上面各 describe 里）。
+    expect(sensitiveCardActionMeta('stop_turn')).toBeDefined();
+    expect(sensitiveCardActionMeta('compact_session')).toBeDefined();
   });
 });
 

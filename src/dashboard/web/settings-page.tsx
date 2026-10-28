@@ -1,12 +1,23 @@
 import type React from 'react';
-import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
-import { DropdownMenu, FieldTitle, LoadingState, dropdownLabel } from './dashboard-components.js';
+import { useCallback, useEffect, useMemo, useRef, useState, type ComponentProps, type ReactNode } from 'react';
+import { DropdownMenu, FieldTitle, LoadingState, ToggleRow as BaseToggleRow, dropdownLabel } from './dashboard-components.js';
 import { VcConsumerProfilesGate } from './vc-consumer-profiles-section.js';
 import { useT } from './react-hooks.js';
 import { mountReactPage, type PageDisposer } from './react-mount.js';
+import { clearHashQueryParam, hashQueryParam } from './dashboard-routes.js';
 import { store } from './store.js';
-import { updateResponseNeedsRestart } from './update-action.js';
+import {
+  updateResponseNeedsRestart,
+  pollUpdateStatus,
+  classifyOtherUpdate,
+  observedInstallCompleted,
+  binaryProgressText,
+} from './update-action.js';
 import { ui } from './ui.js';
+import { SessionEnvEditor, type SessionEnvScope } from './session-env-editor.js';
+import { SETTINGS_SECTIONS, type SettingsSection } from './settings-sections.js';
+import { PromptCacheEditor } from './prompt-cache-editor.js';
+import { readPromptCacheConfig, type PromptCacheConfig } from '../../services/prompt-cache-policy.js';
 import { confirm } from './confirm-modal.js';
 import { toast } from './toast.js';
 import {
@@ -14,6 +25,8 @@ import {
   idleCleanupHoursLabel,
   type IdleCleanupHours,
 } from '../session-cleanup.js';
+
+const GLOBAL_SESSION_ENV_SCOPE: SessionEnvScope = { kind: 'global' };
 
 interface MaintenanceTaskCfg { enabled?: boolean; time?: string }
 interface MaintenanceCfg { autoUpdate?: MaintenanceTaskCfg; autoRestart?: MaintenanceTaskCfg }
@@ -34,6 +47,7 @@ interface DashboardSettings {
   };
   codexRpcInput: boolean;
   autoUpgradeCodexSessions: boolean;
+  reapOrphanTmuxServers: boolean;
   bypassCodexHookTrust: boolean;
   hideCodexRateLimitModelNudge: boolean;
   cardBrandLabel: boolean;
@@ -86,11 +100,14 @@ interface DashboardSettings {
   autoUpdateSupported: boolean;
   whiteboard: { enabled: boolean };
   workflow: { enabled: boolean };
-  sessionCleanup: { enabled: boolean; olderThanHours: IdleCleanupHours; intervalMinutes: number };
+  sessionCleanup: { archiveCodex?: boolean; enabled: boolean; olderThanHours: IdleCleanupHours; intervalMinutes: number };
+  promptCache: PromptCacheConfig | null;
   multiTopic: { enabled: boolean };
   remoteAccess: boolean;
   /** OAuth 回跳基址；'' = 未配置（退回 127.0.0.1 粘贴流程）。 */
   oauthRedirectBase: string;
+  /** GitHub Release 下载代理（二进制自更新）；'' = 未配置（读 HTTPS_PROXY / HTTP_PROXY）。 */
+  httpProxy: string;
   scheduleTimeZone: string;
   hostTimeZone: string;
   effectiveScheduleTimeZone: string;
@@ -122,6 +139,7 @@ interface CliRuntimeUpdateStatus {
 interface UpdateStatus {
   current: string;
   latest: string | null;
+  latestSource?: 'configured' | 'public' | 'configured-fallback' | null;
   behind: boolean;
   cliBehind: boolean;
   cliUpdates: CliRuntimeUpdateStatus[];
@@ -192,6 +210,7 @@ function parseSettings(s: any): DashboardSettings {
     },
     codexRpcInput: s?.codexRpcInput === true,
     autoUpgradeCodexSessions: s?.autoUpgradeCodexSessions === true,
+    reapOrphanTmuxServers: s?.reapOrphanTmuxServers === true,
     // default ON — only an explicit persisted false disables (matches server snapshot)
     bypassCodexHookTrust: s?.bypassCodexHookTrust !== false,
     hideCodexRateLimitModelNudge: s?.hideCodexRateLimitModelNudge !== false,
@@ -245,6 +264,7 @@ function parseSettings(s: any): DashboardSettings {
     whiteboard: { enabled: s?.whiteboard?.enabled === true },
     workflow: { enabled: s?.workflow?.enabled === true },
     sessionCleanup: {
+      archiveCodex: s?.sessionCleanup?.archiveCodex === true,
       enabled: s?.sessionCleanup?.enabled === true,
       olderThanHours: (IDLE_CLEANUP_HOUR_OPTIONS as readonly unknown[]).includes(s?.sessionCleanup?.olderThanHours)
         ? s.sessionCleanup.olderThanHours as IdleCleanupHours
@@ -253,9 +273,11 @@ function parseSettings(s: any): DashboardSettings {
         ? Math.floor(s.sessionCleanup.intervalMinutes)
         : 60,
     },
+    promptCache: readPromptCacheConfig(s?.promptCache) ?? null,
     multiTopic: { enabled: s?.multiTopic?.enabled !== false },
     remoteAccess: s?.remoteAccess === true,
     oauthRedirectBase: typeof s?.oauthRedirectBase === 'string' ? s.oauthRedirectBase : '',
+    httpProxy: typeof s?.httpProxy === 'string' ? s.httpProxy : '',
     scheduleTimeZone: typeof s?.scheduleTimeZone === 'string' ? s.scheduleTimeZone : '',
     hostTimeZone: typeof s?.hostTimeZone === 'string' && s.hostTimeZone ? s.hostTimeZone : 'UTC',
     effectiveScheduleTimeZone:
@@ -285,6 +307,7 @@ function SettingsPage() {
   const tr = useT();
   const mountedRef = useRef(false);
   const timersRef = useRef<Set<number>>(new Set());
+  const updatePollStopRef = useRef<(() => void) | null>(null);
   const [settings, setSettings] = useState<DashboardSettings | null>(null);
   const [settingsLoaded, setSettingsLoaded] = useState(false);
   const [loadError, setLoadError] = useState<string | null>(null);
@@ -309,6 +332,22 @@ function SettingsPage() {
   const [autostartError, setAutostartError] = useState(false);
   const [autostartBusy, setAutostartBusy] = useState(false);
   const [autostartMsg, setAutostartMsg] = useState<StatusMessage>(null);
+
+  // `#/settings?section=<区块 id>&field=<字段标题 i18n key>`（⌘K 全局搜索）：区块要等
+  // /api/settings 回来才渲染，所以在 settings 首次就绪后滚过去并闪烁定位，然后清掉参数。
+  const focusTargetRef = useRef<{ section: string; field: string | null } | null>(null);
+  if (focusTargetRef.current === null && !settings) {
+    const section = hashQueryParam('section');
+    if (section) focusTargetRef.current = { section, field: hashQueryParam('field') };
+  }
+  useEffect(() => {
+    const target = focusTargetRef.current;
+    if (!settings || !target) return;
+    focusTargetRef.current = null;
+    clearHashQueryParam('section');
+    clearHashQueryParam('field');
+    window.requestAnimationFrame(() => focusSettingsTarget(target.section, target.field ? tr(target.field) : null));
+  }, [settings, tr]);
 
   const clearTimers = useCallback(() => {
     for (const id of timersRef.current) window.clearTimeout(id);
@@ -391,6 +430,8 @@ function SettingsPage() {
     return () => {
       mountedRef.current = false;
       clearTimers();
+      updatePollStopRef.current?.();
+      updatePollStopRef.current = null;
     };
   }, [clearTimers, loadSettings]);
 
@@ -605,11 +646,58 @@ function SettingsPage() {
     if (!await confirm({ title: tr('update.confirmUpdateTitle'), message: confirmMsg, confirmLabel: tr('update.btnRunUpdate'), cancelLabel: tr('update.btnCancel') })) return;
     setUpBusy(true);
     setUpMsg({ text: localDev ? tr('update.updatingLocalDev') : tr('update.updating', { command: s.updateCommand! }) });
+    const stopUpdatePoll = (): void => {
+      updatePollStopRef.current?.();
+      updatePollStopRef.current = null;
+    };
+    // Standalone-binary updates download a ~174MB asset; surface measured byte
+    // progress from /api/update/status while the long POST is in flight.
+    updatePollStopRef.current = pollUpdateStatus(fetch, snap => {
+      if (mountedRef.current && snap.binaryUpdate) {
+        setUpMsg({ text: binaryProgressText(snap.binaryUpdate, tr) });
+      }
+    }, 1000);
     try {
       const r = await fetch('/api/update/run', { method: 'POST' });
       const body = await r.json().catch(() => ({}));
-      if (!mountedRef.current) return;
+      if (!mountedRef.current) { stopUpdatePoll(); return; }
       if (!r.ok || body.ok === false) {
+        // Another update (another dashboard tab, the CLI, or scheduled
+        // maintenance) owns the shared install lock. Track it via status rather
+        // than reporting a failure: the cross-process flag is invisible, so
+        // install completion is decided from version state. "Installed" does NOT
+        // reload the page — the winner may be sitting on its own restart
+        // confirmation, and a CLI update never restarts; surface the pending
+        // restart and let the existing restart flow apply it.
+        if (body?.error === 'update_in_flight') {
+          const startVersion = String(s.current);
+          stopUpdatePoll();
+          updatePollStopRef.current = pollUpdateStatus(fetch, snap => {
+            if (!mountedRef.current) return;
+            const kind = classifyOtherUpdate(snap);
+            if (observedInstallCompleted(snap, startVersion, false)) {
+              stopUpdatePoll();
+              setUpBusy(false);
+              setUpMsg({ text: tr('update.noRestartHint'), cls: 'hint-ok' });
+              void fetchStatus();
+              return;
+            }
+            if (kind === 'progress' && snap.binaryUpdate) {
+              setUpMsg({ text: binaryProgressText(snap.binaryUpdate, tr) });
+            } else {
+              setUpMsg({ text: tr(kind === 'busy' ? 'update.inProgressBusy' : 'update.inProgressExternal') });
+            }
+          }, 1000, 10 * 60_000, () => {
+            // Independent of status responses: persistent 503s, a dead
+            // network, or a hung request must still reach this terminal state.
+            if (!mountedRef.current) return;
+            updatePollStopRef.current = null;
+            setUpBusy(false);
+            setUpMsg({ text: tr('update.inProgressSlow'), cls: 'hint-warn-inline' });
+          });
+          return;
+        }
+        stopUpdatePoll();
         // Dirty worktree fails closed — surface the file list so the user can act.
         if (body?.error === 'dirty_worktree') {
           setUpBusy(false);
@@ -621,6 +709,7 @@ function SettingsPage() {
         setUpMsg({ text: tr('update.updateFailed', { detail }), cls: 'hint-warn-inline' });
         return;
       }
+      stopUpdatePoll();
       // A restart is needed when the server says so (local-dev build always
       // regenerates dist/, even when HEAD didn't move) or when the version
       // changed (generic npm/pnpm/bun path, which sets no restartRequired).
@@ -646,6 +735,7 @@ function SettingsPage() {
         await fetchStatus();
       }
     } catch (e) {
+      stopUpdatePoll();
       if (!mountedRef.current) return;
       setUpBusy(false);
       setUpMsg({ text: tr('update.updateFailed', { detail: e instanceof Error ? e.message : String(e) }), cls: 'hint-warn-inline' });
@@ -728,7 +818,7 @@ function SettingsPage() {
   );
 }
 
-function SettingsBody(props: {
+export function SettingsBody(props: {
   settings: DashboardSettings;
   canWrite: boolean;
   bound: boolean;
@@ -749,7 +839,7 @@ function SettingsBody(props: {
   const autoUpdateDisabled = !canWrite || settings.localDevInstall || !settings.autoUpdateSupported;
   const autoRestartDisabled = !canWrite || settings.maintenance.autoUpdate?.enabled !== true;
 
-  const saveBoolean = (key: 'publicReadOnly' | 'openTerminalInFeishu' | 'enableLocalCliOpen' | 'chatBotDiscovery' | 'codexRpcInput' | 'autoUpgradeCodexSessions' | 'bypassCodexHookTrust' | 'hideCodexRateLimitModelNudge' | 'cardBrandLabel' | 'noVisibleOutputHint' | 'crossPrincipalInterruption' | 'remoteAccess', value: boolean) => {
+  const saveBoolean = (key: 'publicReadOnly' | 'openTerminalInFeishu' | 'enableLocalCliOpen' | 'chatBotDiscovery' | 'codexRpcInput' | 'autoUpgradeCodexSessions' | 'reapOrphanTmuxServers' | 'bypassCodexHookTrust' | 'hideCodexRateLimitModelNudge' | 'cardBrandLabel' | 'noVisibleOutputHint' | 'crossPrincipalInterruption' | 'remoteAccess', value: boolean) => {
     void props.onSave(key, { [key]: value }, s => ({ ...s, [key]: value }));
   };
   const saveHerdrTraexPlugin = (patch: Partial<Pick<DashboardSettings['herdrTraexPlugin'], 'enabled' | 'source' | 'ref'>>) => {
@@ -907,6 +997,13 @@ function SettingsBody(props: {
             onChange={value => saveBoolean('autoUpgradeCodexSessions', value)}
           />
           <ToggleRow
+            title={tr('settings.reapOrphanTmuxServers')}
+            help={tr('settings.reapOrphanTmuxServersHelp')}
+            checked={settings.reapOrphanTmuxServers}
+            disabled={dis || savingKey === 'reapOrphanTmuxServers'}
+            onChange={value => saveBoolean('reapOrphanTmuxServers', value)}
+          />
+          <ToggleRow
             title={tr('settings.bypassCodexHookTrust')}
             help={tr('settings.bypassCodexHookTrustHelp')}
             checked={settings.bypassCodexHookTrust}
@@ -960,7 +1057,7 @@ function SettingsBody(props: {
             }}
           />
         </SettingsBlock>
-        <SettingsBlock title={tr('settings.sectionWorkflow')}>
+        <SettingsBlock id="settings-workflow" title={tr('settings.sectionWorkflow')}>
           <ToggleRow
             title={tr('settings.workflowEnable')}
             help={tr('settings.workflowEnableHelp')}
@@ -971,7 +1068,7 @@ function SettingsBody(props: {
             }}
           />
         </SettingsBlock>
-        <SettingsBlock title={tr('settings.sectionMultiTopic')}>
+        <SettingsBlock id="settings-multi-topic" title={tr('settings.sectionMultiTopic')}>
           <ToggleRow
             title={tr('settings.multiTopicEnable')}
             help={tr('settings.multiTopicEnableHelp')}
@@ -1023,6 +1120,21 @@ function SettingsBody(props: {
               );
             }}
           />
+        </SettingsBlock>
+        <SettingsBlock id="settings-prompt-cache" title={tr('settings.sectionPromptCache')}>
+          <p className="settings-help">{tr('settings.promptCacheNote')}</p>
+          <PromptCacheEditor
+            scope="global"
+            value={settings.promptCache}
+            disabled={dis || savingKey === 'promptCache'}
+            onSave={next => props.onSave('promptCache', { promptCache: next }, s => ({ ...s, promptCache: next }))}
+          />
+        </SettingsBlock>
+      </SettingsGroup>
+      {/* 表格型区块：不进上面的瀑布流窄栏，单独一组占满宽度。 */}
+      <SettingsGroup className="settings-group-session-env">
+        <SettingsBlock id="settings-session-env" title={tr('sessionEnv.sectionTitle')}>
+          <SessionEnvEditor scope={GLOBAL_SESSION_ENV_SCOPE} />
         </SettingsBlock>
       </SettingsGroup>
       </SettingsModule>
@@ -1132,8 +1244,17 @@ function SettingsBody(props: {
               />
             </div>
           </div>
+          <HttpProxyRow
+            value={settings.httpProxy}
+            disabled={!canWrite || savingKey === 'httpProxy'}
+            onSave={value => props.onSave(
+              'httpProxy',
+              { httpProxy: value },
+              st => ({ ...st, httpProxy: value }),
+            )}
+          />
         </SettingsBlock>
-        <div id="settings-update">{props.updateBlock}</div>
+        <div>{props.updateBlock}</div>
       </SettingsGroup>
       </SettingsModule>
       <div className="settings-status-row">
@@ -1144,51 +1265,49 @@ function SettingsBody(props: {
   );
 }
 
-function SettingsNav(props: { tr: ReturnType<typeof useT> }): React.JSX.Element {
+/** 滚到区块（有字段标题时定位到那一行）并闪一下，让人一眼看到落点。 */
+function focusSettingsTarget(sectionId: string, fieldTitle: string | null): void {
+  const section = document.getElementById(sectionId);
+  if (!section) return;
+  let target: HTMLElement = section;
+  if (fieldTitle) {
+    const title = [...section.querySelectorAll<HTMLElement>('.ui-field-title-text')]
+      .find(el => el.textContent?.trim() === fieldTitle);
+    const row = title?.closest<HTMLElement>('.toggle-row, .settings-field-row, .settings-subfield') ?? title;
+    if (row) target = row;
+  }
+  target.scrollIntoView({ behavior: 'smooth', block: target === section ? 'start' : 'center' });
+  target.classList.remove('palette-target-flash');
+  void target.offsetWidth;
+  target.classList.add('palette-target-flash');
+  window.setTimeout(() => target.classList.remove('palette-target-flash'), 2_400);
+}
+
+/** 导航按 SETTINGS_SECTIONS 生成：它的顺序就是页面区块的顺序，导航与区块一一对应。 */
+export function SettingsNav(props: { tr: ReturnType<typeof useT> }): React.JSX.Element {
   const tr = props.tr;
-  const groups = [
-    {
-      label: tr('settings.moduleGeneral'),
-      items: [
-        { id: 'settings-access', label: tr('settings.sectionAccess') },
-        { id: 'settings-cards', label: tr('settings.sectionCards') },
-        { id: 'settings-group-creation', label: tr('settings.sectionGroupCreation') },
-        { id: 'settings-experimental', label: tr('settings.sectionExperimental') },
-        { id: 'settings-overload', label: tr('settings.sectionHostOverloadAlert') },
-        { id: 'settings-whiteboard', label: tr('settings.sectionWhiteboard') },
-        { id: 'settings-repo-picker', label: tr('settings.sectionRepoPicker') },
-        { id: 'settings-schedule', label: tr('settings.sectionSchedule') },
-      ],
-    },
-    {
-      label: tr('settings.moduleMeeting'),
-      items: [
-        { id: 'settings-vc', label: tr('settings.sectionVcMeetingAgent') },
-      ],
-    },
-    {
-      label: tr('settings.moduleSystem'),
-      items: [
-        { id: 'settings-maintenance', label: tr('settings.sectionMaintenance') },
-        { id: 'settings-update', label: tr('settings.sectionUpdate') },
-      ],
-    },
-  ];
+  const groups: Array<{ module: string; items: SettingsSection[] }> = [];
+  for (const section of SETTINGS_SECTIONS) {
+    const last = groups[groups.length - 1];
+    if (last?.module === section.module) last.items.push(section);
+    else groups.push({ module: section.module, items: [section] });
+  }
   return (
     <nav className="settings-nav" aria-label={tr('settings.title')}>
       {groups.map(group => (
-        <div key={group.label} className="settings-nav-group">
-          <p className="settings-nav-group-label">{group.label}</p>
+        <div key={group.module} className="settings-nav-group">
+          <p className="settings-nav-group-label">{tr(group.module)}</p>
           {group.items.map(item => (
             <button
               key={item.id}
               type="button"
               className="settings-nav-link"
+              data-section={item.id}
               onClick={() => {
                 document.getElementById(item.id)?.scrollIntoView({ behavior: 'smooth', block: 'start' });
               }}
             >
-              {item.label}
+              {tr(item.section)}
             </button>
           ))}
         </div>
@@ -1556,36 +1675,18 @@ export function TimeZoneRow(props: {
   );
 }
 
-function ToggleRow(props: {
-  title: string;
-  help: string;
-  checked: boolean;
-  disabled: boolean;
-  onChange(value: boolean): void;
-}) {
-  return (
-    <label className="toggle-row">
-      <input
-        type="checkbox"
-        checked={props.checked}
-        disabled={props.disabled}
-        onChange={e => props.onChange(e.currentTarget.checked)}
-      />
-      <span className="switch" aria-hidden="true" />
-      <span className="toggle-tx">
-        <strong><FieldTitle className="settings-toggle-title" help={props.help}>{props.title}</FieldTitle></strong>
-      </span>
-    </label>
-  );
+/** settings 页的开关行：共享 ToggleRow + 本页的标题样式钩子。 */
+function ToggleRow(props: Omit<ComponentProps<typeof BaseToggleRow>, 'TitleComponent' | 'titleClassName'>) {
+  return <BaseToggleRow {...props} titleClassName="settings-toggle-title" />;
 }
 
 const GROUP_NAME_PREFIX_INPUT_MAX_LENGTH = 32;
 
 /** 定时自动清理空闲会话：开关 + 空闲阈值（24H/72H/7d，与手动清理一致）+ 检查频率。 */
 function SessionCleanupRow(props: {
-  value: { enabled: boolean; olderThanHours: IdleCleanupHours; intervalMinutes: number };
+  value: { archiveCodex?: boolean; enabled: boolean; olderThanHours: IdleCleanupHours; intervalMinutes: number };
   disabled: boolean;
-  onSave(patch: { enabled?: boolean; olderThanHours?: IdleCleanupHours; intervalMinutes?: number }): void;
+  onSave(patch: { archiveCodex?: boolean; enabled?: boolean; olderThanHours?: IdleCleanupHours; intervalMinutes?: number }): void;
 }) {
   const tr = useT();
   const [intervalDraft, setIntervalDraft] = useState(String(props.value.intervalMinutes));
@@ -1597,6 +1698,13 @@ function SessionCleanupRow(props: {
 
   return (
     <div className="settings-session-cleanup">
+      <ToggleRow
+        title={tr('settings.sessionCleanupArchiveCodex')}
+        help={tr('settings.sessionCleanupArchiveCodexHelp')}
+        checked={props.value.archiveCodex === true}
+        disabled={props.disabled}
+        onChange={value => props.onSave({ archiveCodex: value })}
+      />
       <ToggleRow
         title={tr('settings.sessionCleanupEnable')}
         help={tr('settings.sessionCleanupEnableHelp')}
@@ -1718,6 +1826,75 @@ export function currentBrowserOrigin(): string {
 
 /** 与服务端 `normalizeOAuthRedirectBase` 同一套判定（http(s) origin，不带路径/
  *  query/fragment），只是提前到前端，避免用户点了保存才吃一个 error code。 */
+/** Mirrors the server's normalizeHttpProxy: `http://[user:pass@]host[:port]`,
+ *  no path / query (the download tunnel dials the proxy over plain HTTP). */
+export function isValidHttpProxy(raw: string): boolean {
+  const value = raw.trim().replace(/\/+$/, '');
+  if (!/^http:\/\//i.test(value)) return false;
+  try {
+    const url = new URL(value);
+    return !!url.hostname && url.pathname === '/' && !url.search && !url.hash;
+  } catch {
+    return false;
+  }
+}
+
+/** Proxy for downloading new botmux binaries from GitHub Releases. */
+export function HttpProxyRow(props: {
+  value: string;
+  disabled: boolean;
+  onSave(value: string): Promise<void> | void;
+}) {
+  const tr = useT();
+  const [draft, setDraft] = useState(props.value);
+  useEffect(() => setDraft(props.value), [props.value]);
+
+  const trimmed = draft.trim().replace(/\/+$/, '');
+  // 空串合法（= 清除配置，退回环境变量）。
+  const valid = trimmed === '' || isValidHttpProxy(trimmed);
+  const dirty = trimmed !== props.value.trim().replace(/\/+$/, '');
+  const submit = () => {
+    if (props.disabled || !dirty || !valid) return;
+    void props.onSave(trimmed);
+  };
+
+  return (
+    <div className="settings-subfield settings-http-proxy-editor">
+      <div className="settings-field-row">
+        <FieldTitle help={tr('settings.httpProxyHelp')}>{tr('settings.httpProxy')}</FieldTitle>
+        <input
+          className="settings-text-input"
+          type="text"
+          data-input="httpProxy"
+          value={draft}
+          placeholder={tr('settings.httpProxyPlaceholder')}
+          disabled={props.disabled}
+          autoComplete="off"
+          spellCheck={false}
+          onChange={event => setDraft(event.currentTarget.value)}
+          onKeyDown={event => { if (event.key === 'Enter') { event.preventDefault(); submit(); } }}
+        />
+      </div>
+      <p className="settings-subfield-hint" data-http-proxy-hint>
+        {trimmed === ''
+          ? tr('settings.httpProxyUnset')
+          : valid ? tr('settings.httpProxyActive') : tr('settings.httpProxyInvalid')}
+      </p>
+      <div className="actions">
+        <button
+          type="button"
+          className="page-primary-action"
+          data-action="http-proxy-save"
+          disabled={props.disabled || !dirty || !valid}
+          onClick={submit}
+        >
+          {tr('settings.httpProxySave')}
+        </button>
+      </div>
+    </div>
+  );
+}
+
 export function isValidOAuthRedirectBase(raw: string): boolean {
   const value = raw.trim();
   if (!/^https?:\/\//i.test(value)) return false;
@@ -1880,7 +2057,7 @@ function TraexPluginEditor(props: {
   );
 }
 
-function AutostartCard(props: {
+export function AutostartCard(props: {
   canWrite: boolean;
   state: AutostartState | null;
   loading: boolean;
@@ -1929,10 +2106,10 @@ function AutostartCard(props: {
     content = null;
   }
 
-  return <SettingsBlock title={tr('settings.sectionAutostart')}>{content}</SettingsBlock>;
+  return <SettingsBlock id="settings-autostart" title={tr('settings.sectionAutostart')}>{content}</SettingsBlock>;
 }
 
-function UpdateCard(props: {
+export function UpdateCard(props: {
   canWrite: boolean;
   status: UpdateStatus | null;
   statusError: string | null;
@@ -2004,6 +2181,7 @@ function UpdateCard(props: {
   }
   return (
     <SettingsBlock
+      id="settings-update"
       className="settings-update-block"
       title={tr('update.section')}
       titleExtra={props.status?.localDevInstall
@@ -2053,10 +2231,15 @@ export function CliRuntimeUpdates(props: { entries: CliRuntimeUpdateStatus[] }) 
   );
 }
 
-function UpdateBadge(props: { status: UpdateStatus }) {
+export function UpdateBadge(props: { status: UpdateStatus }) {
   const tr = useT();
   const s = props.status;
   if (!s.latest) return <span className="hint-warn-inline">{tr('update.checkUnavailable')}</span>;
+  if (s.latestSource === 'configured-fallback') {
+    return s.behind
+      ? <span className="update-badge update-badge-new">{tr('update.mirrorNewAvailable', { version: `v${s.latest}` })}</span>
+      : <span className="update-badge update-badge-ok">{tr('update.mirrorUpToDate')}</span>;
+  }
   return s.behind
     ? <span className="update-badge update-badge-new">{tr('update.newAvailable', { version: `v${s.latest}` })}</span>
     : <span className="update-badge update-badge-ok">{tr('update.upToDate')}</span>;

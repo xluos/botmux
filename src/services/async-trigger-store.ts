@@ -21,7 +21,7 @@
  * latest-wins polling (by sessionId) and exact-match polling (by triggerId)
  * resolve after a restart.
  */
-import { readFileSync, writeFileSync, mkdirSync, existsSync, renameSync, unlinkSync } from 'node:fs';
+import { readFileSync, mkdirSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { config } from '../config.js';
 import { logger } from '../utils/logger.js';
@@ -182,11 +182,8 @@ function loadStrict(sessionId: string): AsyncTriggerFile {
 
 function save(sessionId: string, file: AsyncTriggerFile): void {
   ensureDir();
-  const fp = getFilePath(sessionId);
-  const tmpFp = fp + '.tmp';
   try {
-    writeFileSync(tmpFp, JSON.stringify(file, null, 2), 'utf-8');
-    renameSync(tmpFp, fp);
+    atomicWriteFileSync(getFilePath(sessionId), JSON.stringify(file, null, 2), { followTargetSymlink: false });
   } catch (err) {
     logger.debug(`Failed to persist async trigger results for ${sessionId}: ${err}`);
   }
@@ -548,10 +545,4 @@ export function followSteerParkedChain(
     next = hit.result.steerParkedBy;
   }
   return undefined;
-}
-
-/** Delete a session's persisted async results (called on session close). */
-export function deleteResults(sessionId: string): void {
-  const fp = getFilePath(sessionId);
-  try { if (existsSync(fp)) unlinkSync(fp); } catch { /* ignore */ }
 }

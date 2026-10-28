@@ -12,6 +12,11 @@ import {
   type Page,
 } from 'playwright';
 import { spawnTsScript } from '../helpers/ts-runner.js';
+import {
+  E2E_VIDEO_DIR,
+  e2eVideoRecordingEnabled,
+  publishPageVideo,
+} from '../e2e-browser/e2e-video.js';
 
 interface DashboardContext {
   agent?: PlaywrightAgent;
@@ -129,12 +134,42 @@ const dashboardSetup = defineProjectSetup<DashboardContext>({
       args: ['--no-sandbox', '--disable-setuid-sandbox'],
     });
     onTeardown(() => browser.close());
+    const recordVideo = e2eVideoRecordingEnabled();
+    if (recordVideo) await mkdir(E2E_VIDEO_DIR, { recursive: true });
     const browserContext = await browser.newContext({
       locale: 'en-US',
       viewport: { width: 1440, height: 960 },
+      ...(recordVideo
+        ? {
+            recordVideo: {
+              dir: E2E_VIDEO_DIR,
+              size: { width: 1440, height: 960 },
+            },
+          }
+        : {}),
     });
-    onTeardown(() => browserContext.close());
     const page = await browserContext.newPage();
+    // Any 401 opens the 「访问链接已失效」 overlay, which covers the pages under
+    // test; CI hit it once in public read-only mode. Log the request so a
+    // failure names the endpoint instead of only showing the overlay.
+    page.on('response', (response) => {
+      const status = response.status();
+      if (status !== 401 && status !== 403) return;
+      const { pathname } = new URL(response.url());
+      console.warn(`[dashboard] HTTP ${status} ${response.request().method()} ${pathname}`);
+    });
+    onTeardown(async () => {
+      await browserContext.close();
+      try {
+        await publishPageVideo(
+          page,
+          'Navigate the core read-only Dashboard pages',
+          'dashboard-smoke',
+        );
+      } catch (error) {
+        console.error('Dashboard video publish failed:', error);
+      }
+    });
     const response = await page.goto(`http://127.0.0.1:${port}/`, {
       waitUntil: 'domcontentloaded',
       timeout: 30_000,

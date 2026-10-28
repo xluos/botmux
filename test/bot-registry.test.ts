@@ -66,7 +66,36 @@ function makeCfg(overrides: Record<string, unknown> = {}) {
   };
 }
 
+describe('meeting inviter configuration', () => {
+  it.each([
+    [{}, undefined, undefined],
+    [{ inviterManagementEnabled: false }, false, undefined],
+    [{ inviterManagementEnabled: true, inviterManagementEnabledAt: 123 }, true, 123],
+    [{ inviterManagementEnabled: 'true', inviterManagementEnabledAt: '123' }, undefined, undefined],
+    [{ inviterManagementEnabled: 1, inviterManagementEnabledAt: -1 }, undefined, undefined],
+  ])('normalizes policy strictly without enabling old configurations: %#', async (vcMeetingAgent, enabled, epoch) => {
+    const mod = await freshImport();
+    const [config] = mod.parseBotConfigsFromText(JSON.stringify([makeCfg({ vcMeetingAgent })]));
+    expect(config.vcMeetingAgent?.inviterManagementEnabled).toBe(enabled);
+    expect(config.vcMeetingAgent?.inviterManagementEnabledAt).toBe(epoch);
+  });
+});
+
 describe('voice configuration', () => {
+  it.each([
+    [{ volcengine: null }, { volcengine: null }],
+    [{ volcengine: { mode: 'typo' } }, { volcengine: null }],
+    [{ engine: 'volcengine', volcengine: { mode: 'agent-plan', apiKey: ' P ' } },
+      { engine: 'volcengine', volcengine: { mode: 'agent-plan', apiKey: 'P' } }],
+    [{ volcengine: { mode: 'standard' } }, { volcengine: { mode: 'standard' } }],
+    [{ rate: 1.2 }, { rate: 1.2 }],
+    [{ speaker: 'custom' }, { speaker: 'custom' }],
+  ])('retains Volcengine denial and scalar overrides, row %#', async (voice, expected) => {
+    const mod = await freshImport();
+    const configs = mod.parseBotConfigsFromText(JSON.stringify([makeCfg({ voice })]));
+    expect(configs[0]?.voice).toEqual(expected);
+  });
+
   it('preserves a MiniMax per-bot override', async () => {
     const mod = await freshImport();
     const [config] = mod.parseBotConfigsFromText(JSON.stringify([
@@ -457,7 +486,18 @@ describe('parseBotConfigsFromText — brand', () => {
     ]))).toThrow(/must exactly match cliRuntime\.executable/);
   });
 
-  it('rejects cliRuntime outside the plain Codex adapter contract', () => {
+  it('loads a named CodeM runtime with the Kimi adapter and exact path shadow', () => {
+    const [cfg] = mod.parseBotConfigsFromText(JSON.stringify([{
+      larkAppId: 'codem-runtime-app', larkAppSecret: 's', cliId: 'kimi',
+      cliPathOverride: '/opt/bin/codem-wrapper',
+      cliRuntime: { id: 'codem', displayName: 'CodeM', executable: '/opt/bin/codem-wrapper', update: { provider: 'none' } },
+    }]));
+    expect(cfg.cliId).toBe('kimi');
+    expect(cfg.cliRuntime).toMatchObject({ id: 'codem', displayName: 'CodeM', executable: '/opt/bin/codem-wrapper' });
+    expect(cfg.cliPathOverride).toBe('/opt/bin/codem-wrapper');
+  });
+
+  it('rejects cliRuntime outside supported adapter contracts', () => {
     const runtime = { id: 'vendor-codex', executable: 'vendor-codex' };
     expect(() => mod.parseBotConfigsFromText(JSON.stringify([{
       larkAppId: 'wrong-adapter-runtime-app',
@@ -569,6 +609,22 @@ describe('parseBotConfigsFromText — brand', () => {
     expect(mod.effectiveBotDisplayName(state)).toBe('小助手');
   });
 
+  it('retains strict auto-close opt-in across listener config reloads', () => {
+    const [cfg] = mod.parseBotConfigsFromText(JSON.stringify([{
+      larkAppId: 'listener-close', larkAppSecret: 's',
+      globalMessageListener: { enabled: true, prompt: 'global', autoCloseAfterCompletion: true },
+      groupMessageListenerOverrides: {
+        oc_custom: { mode: 'custom', listener: { enabled: true, prompt: 'custom', autoCloseAfterCompletion: false } },
+      },
+      messageListeners: { oc_legacy: { enabled: true, prompt: 'legacy', autoCloseAfterCompletion: 'true' } },
+    }]));
+    expect(cfg.globalMessageListener?.autoCloseAfterCompletion).toBe(true);
+    expect(cfg.groupMessageListenerOverrides?.oc_custom).toMatchObject({ mode: 'custom' });
+    const custom = cfg.groupMessageListenerOverrides?.oc_custom;
+    if (custom?.mode === 'custom') expect(custom.listener.autoCloseAfterCompletion).toBeUndefined();
+    expect(cfg.messageListeners?.oc_legacy.autoCloseAfterCompletion).toBeUndefined();
+  });
+
   it('normalizes per-chat messageListeners without enabling them by default', () => {
     const [cfg] = mod.parseBotConfigsFromText(JSON.stringify([
       {
@@ -637,6 +693,12 @@ describe('parseBotConfigsFromText — brand', () => {
       ]));
       expect(cfg.startupCommands).toBeUndefined();
     }
+  });
+
+  it('preserves explicit false listener-policy overrides for future meetings', () => {
+    const [cfg] = mod.parseBotConfigsFromText(JSON.stringify([{ larkAppId: 'a', larkAppSecret: 's',
+      vcMeetingAgent: { listenerPolicy: { rawMessages: false, finalSummary: true, allowSummarySharing: false } } }]));
+    expect(cfg.vcMeetingAgent?.listenerPolicy).toEqual({ rawMessages: false, finalSummary: true, allowSummarySharing: false });
   });
 
   it('normalizes vcMeetingAgent.realtimeVoice without enabling it by default', () => {
@@ -1357,6 +1419,26 @@ describe('parseBotConfigsFromText — autoStartOnGroupJoinSeed', () => {
   });
 });
 
+describe('parseBotConfigsFromText — autoStartOnGroupJoinGateRequired', () => {
+  let mod: Awaited<ReturnType<typeof freshImport>>;
+
+  beforeEach(async () => {
+    mod = await freshImport();
+  });
+
+  it('preserves only an explicit true', () => {
+    const [enabled] = mod.parseBotConfigsFromText(JSON.stringify([
+      { larkAppId: 'a', larkAppSecret: 's', autoStartOnGroupJoinGateRequired: true },
+    ]));
+    expect(enabled.autoStartOnGroupJoinGateRequired).toBe(true);
+
+    const [disabled] = mod.parseBotConfigsFromText(JSON.stringify([
+      { larkAppId: 'a', larkAppSecret: 's', autoStartOnGroupJoinGateRequired: false },
+    ]));
+    expect(disabled.autoStartOnGroupJoinGateRequired).toBeUndefined();
+  });
+});
+
 describe('parseBotConfigsFromText — replyStyle', () => {
   let mod: Awaited<ReturnType<typeof freshImport>>;
 
@@ -1448,6 +1530,24 @@ describe('parseBotConfigsFromText — dshProfile cold read', () => {
     expect(dsh.dshProfile).toBe('custom_profile-1');
     expect(invalid.dshProfile).toBeUndefined();
     expect(otherCli.dshProfile).toBeUndefined();
+  });
+});
+
+describe('parseBotConfigsFromText — serviceTier cold read', () => {
+  it('keeps valid tiers only on codex-family CLIs and drops invalid values', async () => {
+    const mod = await freshImport();
+    const [tui, app, unset, invalid, nonCodex] = mod.parseBotConfigsFromText(JSON.stringify([
+      { larkAppId: 'tier-tui', larkAppSecret: 's', cliId: 'codex', serviceTier: 'priority' },
+      { larkAppId: 'tier-app', larkAppSecret: 's', cliId: 'codex-app', serviceTier: 'ultrafast' },
+      { larkAppId: 'tier-unset', larkAppSecret: 's', cliId: 'codex' },
+      { larkAppId: 'tier-invalid', larkAppSecret: 's', cliId: 'codex', serviceTier: 'flex' },
+      { larkAppId: 'tier-claude', larkAppSecret: 's', cliId: 'claude-code', serviceTier: 'priority' },
+    ]));
+    expect(tui.serviceTier).toBe('priority');
+    expect(app.serviceTier).toBe('ultrafast');
+    expect(unset.serviceTier).toBeUndefined();
+    expect(invalid.serviceTier).toBeUndefined();
+    expect(nonCodex.serviceTier).toBeUndefined();
   });
 });
 
@@ -1612,7 +1712,7 @@ describe('loadBotConfigs — core-only synthesis (BOTMUX_CORE_ONLY=1)', () => {
   let mod: Awaited<ReturnType<typeof freshImport>>;
   let fsMock: { existsSync: ReturnType<typeof vi.fn>; readFileSync: ReturnType<typeof vi.fn>; statSync: ReturnType<typeof vi.fn> };
   const saved: Record<string, string | undefined> = {};
-  const CORE_KEYS = ['BOTMUX_CORE_ONLY', 'BOTS_CONFIG', 'BOTMUX_API_ONLY_BOT', 'BOTMUX_CORE_CLI', 'BOTMUX_CORE_WORKING_DIR', 'BOTMUX_CORE_MODEL'];
+  const CORE_KEYS = ['BOTMUX_CORE_ONLY', 'BOTS_CONFIG', 'BOTMUX_API_ONLY_BOT', 'BOTMUX_CORE_CLI', 'BOTMUX_CORE_WORKING_DIR', 'BOTMUX_CORE_MODEL', 'BOTMUX_CORE_BACKEND'];
 
   beforeEach(async () => {
     mod = await freshImport();
@@ -1675,6 +1775,23 @@ describe('loadBotConfigs — core-only synthesis (BOTMUX_CORE_ONLY=1)', () => {
     const [cfg] = mod.loadBotConfigs();
     expect(cfg.larkAppId).toBe('local_riff');
     expect(cfg.cliId).toBe('codex-app');
+    expect(cfg.backendType).toBeUndefined();
+  });
+
+  it('applies an explicit core-only PTY backend without changing the default', () => {
+    fsMock.existsSync.mockReturnValue(false);
+    process.env.BOTMUX_CORE_ONLY = '1';
+    process.env.BOTMUX_CORE_BACKEND = 'pty';
+    const [cfg] = mod.loadBotConfigs();
+    expect(cfg.apiOnly).toBe(true);
+    expect(cfg.backendType).toBe('pty');
+  });
+
+  it('rejects an invalid core-only backend instead of falling back to tmux', () => {
+    fsMock.existsSync.mockReturnValue(false);
+    process.env.BOTMUX_CORE_ONLY = '1';
+    process.env.BOTMUX_CORE_BACKEND = 'zellij';
+    expect(() => mod.loadBotConfigs()).toThrow('BOTMUX_CORE_BACKEND must be tmux or pty');
   });
 
   it('rejects a non-local_ synthetic id (identity must be a synthetic local slug)', () => {
@@ -1898,9 +2015,9 @@ describe('getAllBots', () => {
 });
 
 
-// ─── isChatOncallBoundForAnyBot ───────────────────────────────────────────
+// ─── findOncallChatForAnyBot ──────────────────────────────────────────────
 
-describe('isChatOncallBoundForAnyBot', () => {
+describe('findOncallChatForAnyBot', () => {
   let mod: Awaited<ReturnType<typeof freshImport>>;
   let fsMock: { existsSync: ReturnType<typeof vi.fn>; readFileSync: ReturnType<typeof vi.fn>; statSync: ReturnType<typeof vi.fn> };
 
@@ -1931,9 +2048,8 @@ describe('isChatOncallBoundForAnyBot', () => {
     mod.registerBot(configs[0]);
 
     expect(mod.findOncallChat('app_a', 'oc_oncall')).toBeUndefined();
-    expect(mod.isChatOncallBoundForAnyBot('oc_oncall')).toBe(true);
     expect(mod.findOncallChatForAnyBot('oc_oncall')).toEqual({ chatId: 'oc_oncall', workingDir: '/repo' });
-    expect(mod.isChatOncallBoundForAnyBot('oc_other')).toBe(false);
+    expect(mod.findOncallChatForAnyBot('oc_other')).toBeUndefined();
   });
 
   it('refreshes the sibling oncall cache when bots.json mtime changes', () => {
@@ -1950,14 +2066,13 @@ describe('isChatOncallBoundForAnyBot', () => {
 
     // First lookup builds a negative cache from the original file content.
     fsMock.readFileSync.mockReturnValueOnce(JSON.stringify([{ larkAppId: 'app_a', larkAppSecret: 'sa' }]));
-    expect(mod.isChatOncallBoundForAnyBot('oc_new')).toBe(false);
+    expect(mod.findOncallChatForAnyBot('oc_new')).toBeUndefined();
 
     // A later mtime causes the cache to refresh and pick up sibling bindings.
     fsMock.readFileSync.mockReturnValueOnce(JSON.stringify([
       { larkAppId: 'app_a', larkAppSecret: 'sa' },
       { larkAppId: 'app_b', larkAppSecret: 'sb', oncallChats: [{ chatId: 'oc_new', workingDir: '/repo' }] },
     ]));
-    expect(mod.isChatOncallBoundForAnyBot('oc_new')).toBe(true);
     expect(mod.findOncallChatForAnyBot('oc_new')?.workingDir).toBe('/repo');
   });
 });

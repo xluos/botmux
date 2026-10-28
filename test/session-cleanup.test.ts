@@ -24,7 +24,6 @@ function row(id: string, patch: Record<string, unknown> = {}) {
 
 describe('dashboard idle session cleanup selection', () => {
   it('accepts only the supported cleanup thresholds', () => {
-    expect(IDLE_CLEANUP_HOUR_OPTIONS).toEqual([24, 72, 168]);
     expect(IDLE_CLEANUP_HOUR_OPTIONS).toEqual(SESSION_CLEANUP_HOUR_OPTIONS);
     expect(parseIdleCleanupHours(24)).toBe(24);
     expect(parseIdleCleanupHours('72')).toBe(72);
@@ -84,6 +83,7 @@ describe('dashboard idle session cleanup selection', () => {
       closed: 1,
       failed: 1,
       residual: 0,
+      archiveFailed: 0,
       results: [
         { sessionId: 'old-idle', ok: true },
         { sessionId: 'fails', ok: false, error: 'close_failed' },
@@ -128,6 +128,7 @@ describe('dashboard idle session cleanup selection', () => {
       closed: 2,
       failed: 0,
       residual: 0,
+      archiveFailed: 0,
       results: [
         { sessionId: 'a', ok: true },
         { sessionId: 'b', ok: true },
@@ -147,6 +148,7 @@ describe('dashboard idle session cleanup selection', () => {
       closed: 0,
       failed: 0,
       residual: 0,
+      archiveFailed: 0,
       results: [],
     });
   });

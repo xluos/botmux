@@ -1,14 +1,16 @@
-import type {
-  InboxClaim,
-  DurableInboxEvent,
-  DurableInboxStore,
-  DurableInsertResult,
-  DurableJson,
+import {
+  DURABLE_INBOX_LANE_LARK_MESSAGE,
+  type InboxClaim,
+  type DurableInboxEvent,
+  type DurableInboxStore,
+  type DurableInsertResult,
+  type DurableJson,
 } from './durable-coordination.js';
 
 export type DurableLarkMessageEventType =
   | 'lark.im.message.receive_v1'
-  | 'lark.im.message.updated_v1';
+  | 'lark.im.message.updated_v1'
+  | 'lark.im.message.recalled_v1';
 
 export interface DurableLarkMessageEnvelope {
   version: 1;
@@ -59,10 +61,16 @@ export function parseDurableLarkMessageClaim(claim: InboxClaim): DurableLarkMess
   const message = record(event?.message ?? nestedEvent?.message);
   const eventType = payload?.type;
   const larkAppId = payload?.larkAppId;
-  const messageId = message?.message_id;
-  if (payload?.version !== 1
+  const recall = eventType === 'lark.im.message.recalled_v1'
+    ? (nestedEvent ?? event)
+    : undefined;
+  const messageId = recall?.message_id ?? message?.message_id;
+  if ((claim.event.lane !== undefined
+      && claim.event.lane !== DURABLE_INBOX_LANE_LARK_MESSAGE)
+      || payload?.version !== 1
       || (eventType !== 'lark.im.message.receive_v1'
-        && eventType !== 'lark.im.message.updated_v1')
+        && eventType !== 'lark.im.message.updated_v1'
+        && eventType !== 'lark.im.message.recalled_v1')
       || typeof larkAppId !== 'string'
       || !larkAppId.startsWith('cli_')
       || larkAppId.length > 256
@@ -73,11 +81,15 @@ export function parseDurableLarkMessageClaim(claim: InboxClaim): DurableLarkMess
   }
   const expectedReceiveEventId = `im.message.receive_v1:${larkAppId}:${messageId}`;
   const expectedUpdatedPrefix = `im.message.updated_v1:${larkAppId}:`;
+  const expectedRecalledPrefix = `im.message.recalled_v1:${larkAppId}:`;
   if ((eventType === 'lark.im.message.receive_v1'
       && claim.event.eventId !== expectedReceiveEventId)
       || (eventType === 'lark.im.message.updated_v1'
         && (!claim.event.eventId.startsWith(expectedUpdatedPrefix)
-          || claim.event.eventId.length === expectedUpdatedPrefix.length))) {
+          || claim.event.eventId.length === expectedUpdatedPrefix.length))
+      || (eventType === 'lark.im.message.recalled_v1'
+        && (!claim.event.eventId.startsWith(expectedRecalledPrefix)
+          || claim.event.eventId.length === expectedRecalledPrefix.length))) {
     throw new Error(`durable Lark inbox event ${claim.event.eventId} has a mismatched message identity`);
   }
   if (!claim.event.partitionKey.startsWith(`lark-message-routing:${larkAppId}:`)) {
@@ -121,6 +133,7 @@ export function durableLarkMessageEvent(input: {
   };
   return {
     eventId: input.eventId,
+    lane: DURABLE_INBOX_LANE_LARK_MESSAGE,
     partitionKey: input.partitionKey,
     payload: payload as unknown as DurableJson,
     visibleAt: now,

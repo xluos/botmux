@@ -8,26 +8,20 @@
 import { describe, it, beforeAll, afterAll } from './midscene-suite.js';
 import type { Browser, Page, BrowserContext } from 'playwright';
 import { PlaywrightAgent } from '@midscene/web/playwright';
-import { existsSync } from 'node:fs';
 import {
-  createBrowser,
-  createPage,
-  createAgent,
-  checkPrerequisites,
-  STORAGE_STATE_PATH,
   testMessage,
   messageTag,
   expectedReplyMarker,
   sendMessage,
   sendMentionMessage,
-  navigateToMessenger,
-  openChat,
+  openGroupChat,
   getGroupChatName,
   openThreadForMessage,
   scrollThreadToBottom,
   waitForModelTextReply,
-  closeSession,
+  DIRECT_START_LABEL,
 } from './helpers.js';
+import { openFeishuSession, releaseFeishuSession } from './feishu-session.js';
 
 export function registerMidsceneSuites(): void {
   describe('feishu group @mention routing', () => {
@@ -37,32 +31,18 @@ export function registerMidsceneSuites(): void {
     let agent: PlaywrightAgent;
 
     beforeAll(async () => {
-      checkPrerequisites();
-      if (!existsSync(STORAGE_STATE_PATH)) {
-        throw new Error(
-          'storageState.json not found. Run: pnpm test:e2e-browser:setup',
-        );
-      }
-      browser = await createBrowser();
-      ({ context, page } = await createPage(browser));
-      agent = createAgent(page);
-
-      await navigateToMessenger(page);
-      await openChat(page, agent, getGroupChatName());
+      ({ browser, context, page, agent } = await openFeishuSession((p, a) => openGroupChat(p, a, getGroupChatName())));
     });
 
     afterAll(async () => {
-      await closeSession(agent, page);
-      await agent?.destroy();
-      await context?.close();
-      await browser?.close();
+      await releaseFeishuSession({ browser, context, page, agent }, { closeBotSession: true, publishVideo: false });
     });
 
     it('no @mention in multi-bot group → no bot responds', async () => {
       // Plain tag only — we're testing that NO bot replies, so we MUST NOT
       // instruct the bot to reply. Default testMessage() would ask for a reply.
       const msg = testMessage('no-mention', { plain: true });
-      await sendMessage(agent, msg);
+      await sendMessage(agent, msg, page);
 
       // Wait 30 seconds — bots should NOT respond without @mention
       await page.waitForTimeout(30_000);
@@ -91,7 +71,7 @@ export function registerMidsceneSuites(): void {
       // 走「话题」tab 打开宽版话题视图，同时顺手点掉 repo 选择卡。
       await openThreadForMessage(agent, { msgHint: msg, timeoutMs: 180_000, page });
       try {
-        await page.locator('text=直接开启会话').first().click({ timeout: 5_000 });
+        await page.getByText(DIRECT_START_LABEL).first().click({ timeout: 5_000 });
         await page.waitForTimeout(3000);
       } catch { /* not present, fine */ }
 

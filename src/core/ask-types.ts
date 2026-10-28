@@ -67,6 +67,11 @@ export type AskResult =
   | {
       kind: 'invalidated';
       reason: string;
+      /** card_delivery_failed: delivery never completed; do not describe this as
+       *  a missing answer. claimant_gone / answer_undelivered: the hook never
+       *  re-attached, so the asking CLI is no longer waiting (the latter: an
+       *  answer had been given but could not reach it). */
+      failureCode?: 'card_delivery_failed' | 'claimant_gone' | 'answer_undelivered';
       selected: null;
       by: null;
       comment: null;
@@ -95,6 +100,8 @@ export interface AskJsonOutput {
  *
  *  v0.1.8 变更：`options`/`prompt` 字段替换为 `questions: ReadonlyArray<AskQuestion>`。 */
 export interface CreateAskInput {
+  /** Frozen by the daemon from the exact document turn, never CLI-supplied. */
+  deliveryTarget?: AskDeliveryTarget;
   /** Daemon-bound presentation target; never accepted directly from CLI JSON. */
   replyCardTarget?: { turnId: string; dispatchAttempt?: number;
     /** Frozen by authenticated daemon admission; never accepted from CLI JSON. */
@@ -142,6 +149,7 @@ export interface CreateAskInput {
  *
  *  v0.1.8 变更：`options`/`prompt` 替换为 `questions`。 */
 export interface PendingAsk {
+  deliveryTarget?: AskDeliveryTarget;
   replyCardTarget?: CreateAskInput['replyCardTarget'];
   result?: AskResult;
   askId: string;
@@ -172,10 +180,20 @@ export interface PendingAsk {
   /** Once true, subsequent click attempts return `already_settled`. */
   settled: boolean;
   /** Stable Feishu IM dedupe token for the card send (≤50 chars, derived from
-   *  the ask's requestId). The dispatcher passes it as the message `uuid` so a
-   *  re-send after a daemon restart returns the ORIGINAL message_id instead of
-   *  posting a duplicate card. Absent for non-resumable asks. */
+   *  the ask's scoped key + askId — see dispatchUuidForAsk). The dispatcher
+   *  passes it as the message `uuid` so a re-send of this ask (retry, or after a
+   *  daemon restart) returns the ORIGINAL message_id instead of posting a
+   *  duplicate card. */
   dispatchUuid?: string;
+}
+
+/** Keep the original session/chat identity separate from the IM recipient. */
+export interface AskDeliveryTarget {
+  kind: 'document-author';
+  openId: string;
+  turnId: string;
+  fileToken: string;
+  commentId: string;
 }
 
 /** Outcome of a click-resolution attempt. Card click handler maps these to

@@ -6,6 +6,7 @@ import { fileURLToPath } from 'node:url';
 import { afterEach, describe, expect, it } from 'vitest';
 import { spawnTsScript } from './helpers/ts-runner.js';
 import { seedPersistedSessionRows, readPersistedSessionRows } from './helpers/session-store-disk.js';
+import { readRequestBodyJson } from './helpers/read-request-body.js';
 import { managedOriginCapabilityPath, replaceManagedOriginCapabilityFile } from '../src/core/managed-origin-capability.js';
 import { MANAGED_ORIGIN_PROOF_DOMAIN, writeManagedOriginAttestationProof, type ManagedOriginAttestation } from '../src/core/managed-origin-attestation.js';
 import { readProcessStartIdentity } from '../src/core/session-marker.js';
@@ -60,6 +61,8 @@ async function managed(
   f: ReturnType<typeof fixture>,
   customize?: (proof: ManagedOriginAttestation, index: number) => void,
   managedTurnId = 'om_live',
+  observedRequests?: Array<Record<string, unknown>>,
+  refuseWith?: string,
 ) {
   seedPersistedSessionRows(f.dataDir, app, { [sid]: {
     sessionId: sid, status: 'active', larkAppId: app, chatId: 'oc_chat', rootMessageId: 'om_root',
@@ -68,12 +71,18 @@ async function managed(
   } });
   let calls = 0;
   const server = createServer(async (req, res) => {
-    let body = ''; for await (const chunk of req) body += chunk;
-    const request = JSON.parse(body);
+    const request = await readRequestBodyJson<Record<string, unknown>>(req, { strict: true });
+    if (!request) { res.statusCode = 400; return res.end(JSON.stringify({ ok: false, error: 'bad_json' })); }
+    observedRequests?.push(request);
     const proof: ManagedOriginAttestation = { sessionId: sid, turnId: managedTurnId, callerOpenId: 'ou_owner',
-      larkAppId: app, requiresCodexAppLedger: false, scheduleCreator: { ok: true, ownerUnionId: 'on_owner' } };
+      larkAppId: app, requiresCodexAppLedger: false, scheduleCreator: { ok: true, ownerUnionId: 'on_owner' },
+      scheduleOperator: { ok: true } };
     calls++;
     customize?.(proof, calls);
+    if (refuseWith && (req.url === SCHEDULE_DELEGATED_ADD_ROUTE || req.url === SCHEDULE_MANAGED_MUTATE_ROUTE)) {
+      res.statusCode = 403;
+      return res.end(JSON.stringify({ ok: false, error: refuseWith }));
+    }
     if (req.url === SCHEDULE_DELEGATED_ADD_ROUTE) {
       if (proof.turnId !== managedTurnId) {
         res.statusCode = 409;
@@ -103,7 +112,7 @@ async function managed(
         res.statusCode = 403;
         return res.end(JSON.stringify({ ok: false, error: 'schedule creator bot does not match the session' }));
       }
-      if (proof.scheduleCreator?.ok !== true) {
+      if (proof.scheduleOperator?.ok !== true) {
         res.statusCode = 403;
         return res.end(JSON.stringify({ ok: false, error: 'current turn caller is not an allowed bot operator' }));
       }
@@ -116,7 +125,7 @@ async function managed(
         res.statusCode = 404;
         return res.end(JSON.stringify({ ok: false, error: 'schedule_not_found' }));
       }
-      if (current.preconditionRef) {
+      if (request.action === 'update' && current.preconditionRef) {
         res.statusCode = 409;
         return res.end(JSON.stringify({ ok: false, error: 'schedule_precondition_dashboard_update_required' }));
       }
@@ -163,6 +172,62 @@ async function managed(
 }
 
 describe('schedule CLI prompt updates', () => {
+  it.each([
+    ['add', 'schedule_working_dir_forbidden', '当前工作目录'],
+    ['add', 'schedule_direct_task_limit', '已达上限'],
+    ['update', 'schedule_mutation_scope_forbidden', '本会话所在群'],
+    ['update', 'schedule_working_dir_forbidden', '当前工作目录'],
+  ] as const)('turns a sandbox %s refusal %s into actionable text', async (action, code, text) => {
+    const f = fixture();
+    await managed(f, undefined, 'om_live', undefined, code);
+    const result = action === 'add'
+      ? await f.run(['add', '0 12 * * *', 'new task', '--id', '11223344'])
+      : await f.run(['update', f.task.id, '--prompt', 'changed']);
+    expect(result.code, result.output).not.toBe(0);
+    expect(result.output).toContain(text);
+    expect(result.output).not.toContain(code);
+  });
+
+  it.each(['--topic', '--follow-active'])('binds %s to the current topic in a reused chat session', async flag => {
+    const f = fixture();
+    await managed(f);
+    const rows = readPersistedSessionRows(f.dataDir, app);
+    rows[sid] = { ...rows[sid], scope: 'chat', rootMessageId: 'om_unrelated_first_message',
+      replyTargets: { om_live: { rootMessageId: 'om_current_topic', updatedAt: new Date().toISOString() } },
+      currentReplyTarget: { turnId: 'om_queued', rootMessageId: 'om_queued_topic', updatedAt: new Date().toISOString() },
+    };
+    seedPersistedSessionRows(f.dataDir, app, rows);
+    const result = await f.run(['add', '0 12 * * *', 'new task', flag, '--id', '11223344']);
+    expect(result.code, result.output).toBe(0);
+    expect(f.read()['11223344']).toMatchObject({ executionPosition: 'topic', rootMessageId: 'om_current_topic' });
+  });
+
+  it.each(['missing', 'plain'])('refuses implicit --topic when the exact chat turn is %s', async mode => {
+    const f = fixture();
+    await managed(f);
+    const rows = readPersistedSessionRows(f.dataDir, app);
+    rows[sid] = { ...rows[sid], scope: 'chat', rootMessageId: 'om_unrelated_first_message',
+      replyTargets: mode === 'plain' ? { om_live: { updatedAt: new Date().toISOString() } } : {},
+      currentReplyTarget: { turnId: 'om_other', rootMessageId: 'om_other_topic', updatedAt: new Date().toISOString() },
+    };
+    seedPersistedSessionRows(f.dataDir, app, rows);
+    const result = await f.run(['add', '0 12 * * *', 'new task', '--topic', '--id', '11223344']);
+    expect(result.code, result.output).not.toBe(0);
+    expect(result.output).toContain('话题下执行需要');
+    expect(f.read()['11223344']).toBeUndefined();
+    const explicit = await f.run(['add', '0 12 * * *', 'new task', '--topic', '--root-msg-id', 'om_explicit', '--id', '11223344']);
+    expect(explicit.code, explicit.output).toBe(0);
+    expect(f.read()['11223344'].rootMessageId).toBe('om_explicit');
+  });
+
+  it('keeps the bound root for an ordinary thread session', async () => {
+    const f = fixture();
+    await managed(f);
+    const result = await f.run(['add', '0 12 * * *', 'new task', '--topic', '--id', '11223344']);
+    expect(result.code, result.output).toBe(0);
+    expect(f.read()['11223344'].rootMessageId).toBe('om_root');
+  });
+
   it('documents both update inputs without requiring a configured bot', async () => {
     const f = fixture();
     const result = await f.run(['update', '--help']);
@@ -205,6 +270,175 @@ describe('schedule CLI prompt updates', () => {
     expect(calls()).toBe(4);
     expect(readPersistedSessionRows(f.dataDir, app)[sid].ownerOpenId).toBeUndefined();
   });
+  it('runs an existing protected task with same-app open-id admission and no creator union id', async () => {
+    const f = fixture();
+    await managed(f, proof => { proof.scheduleCreator = { ok: false, error: 'caller_union_id_unresolved' }; });
+    writeFileSync(f.path, JSON.stringify({ [f.task.id]: { ...f.task, enabled: true, preconditionRef: 'host-owned' } }));
+    const result = await f.run(['run', f.task.id]);
+    expect(result.code, result.output).toBe(0);
+    expect(f.read()[f.task.id]).toMatchObject({ manualRunRequested: true, preconditionRef: 'host-owned' });
+    expect(readPersistedSessionRows(f.dataDir, app)[sid].ownerOpenId).toBeUndefined();
+    const create = await f.run(['add', '0 12 * * *', 'new task', '--id', '11223344']);
+    expect(create.code, create.output).not.toBe(0);
+    expect(create.output).toContain('cannot resolve the current turn caller union_id');
+    expect(f.read()['11223344']).toBeUndefined();
+  });
+  it('lets the worker-owned Remote Runner relay reach daemon authorization without a CLI pid marker', async () => {
+    const f = fixture(); const calls = await managed(f);
+    delete f.env.BOTMUX_ORIGIN_CHANNEL_ID;
+    delete f.env.BOTMUX_READ_ISOLATION;
+    Object.assign(f.env, {
+      BOTMUX_HOST_RELAY_AUTHORIZED: '1',
+      BOTMUX_SESSION_ID: sid,
+      BOTMUX_TURN_ID: 'om_live',
+    });
+    const before = Object.keys(f.read());
+    const result = await f.run([
+      'add', '--schedule=10m', '--prompt=remote reminder', '--topic',
+      '--remote-runner-session-tool',
+    ]);
+    expect(result.code, result.output).toBe(0);
+    expect(result.output).toContain('已创建定时任务');
+    const added = Object.keys(f.read()).filter(id => !before.includes(id));
+    expect(added).toHaveLength(1);
+    expect(f.read()[added[0]]).toMatchObject({
+      prompt: 'remote reminder',
+      chatId: 'oc_chat',
+      rootMessageId: 'om_root',
+      executionPosition: 'topic',
+    });
+    expect(calls()).toBe(1);
+  });
+  it('rejects legacy positional schedule input from a Remote Runner relay', async () => {
+    const f = fixture(); const requests: Array<Record<string, unknown>> = [];
+    await managed(f, undefined, 'om_live', requests);
+    delete f.env.BOTMUX_ORIGIN_CHANNEL_ID;
+    delete f.env.BOTMUX_READ_ISOLATION;
+    Object.assign(f.env, {
+      BOTMUX_HOST_RELAY_AUTHORIZED: '1',
+      BOTMUX_SESSION_ID: sid,
+      BOTMUX_TURN_ID: 'om_live',
+    });
+    const before = readFileSync(f.path, 'utf8');
+    const result = await f.run([
+      'add', '10m', 'legacy positional prompt', '--topic',
+      '--remote-runner-session-tool',
+    ]);
+    expect(result.code, result.output).not.toBe(0);
+    expect(result.output).toContain('requires structured schedule/prompt values');
+    expect(requests).toHaveLength(0);
+    expect(readFileSync(f.path, 'utf8')).toBe(before);
+  });
+  it('forwards only a host-relayed Remote Runner controller to daemon authorization', async () => {
+    const f = fixture(); const requests: Array<Record<string, unknown>> = [];
+    await managed(f, undefined, 'om_live', requests);
+    delete f.env.BOTMUX_ORIGIN_CHANNEL_ID;
+    delete f.env.BOTMUX_READ_ISOLATION;
+    Object.assign(f.env, {
+      BOTMUX_HOST_RELAY_AUTHORIZED: '1',
+      BOTMUX_SESSION_ID: sid,
+      BOTMUX_TURN_ID: 'om_live',
+      BOTMUX_REMOTE_RUNNER_CONTROLLER_OPEN_ID: 'ou_developer',
+    });
+    const result = await f.run([
+      'add', '--schedule=10m', '--prompt=remote reminder', '--topic',
+      '--remote-runner-session-tool',
+    ]);
+    expect(result.code, result.output).toBe(0);
+    expect(requests).toContainEqual(expect.objectContaining({
+      remoteRunnerSessionTool: true,
+      remoteRunnerControllerOpenId: 'ou_developer',
+    }));
+  });
+  it('forwards the frozen Remote Runner controller on a structured mutation', async () => {
+    const f = fixture(); const requests: Array<Record<string, unknown>> = [];
+    await managed(f, undefined, 'om_live', requests);
+    delete f.env.BOTMUX_ORIGIN_CHANNEL_ID;
+    delete f.env.BOTMUX_READ_ISOLATION;
+    Object.assign(f.env, {
+      BOTMUX_HOST_RELAY_AUTHORIZED: '1',
+      BOTMUX_SESSION_ID: sid,
+      BOTMUX_TURN_ID: 'om_live',
+      BOTMUX_REMOTE_RUNNER_CONTROLLER_OPEN_ID: 'ou_developer',
+    });
+    const result = await f.run([
+      'remove', f.task.id, '--remote-runner-session-tool',
+    ]);
+    expect(result.code, result.output).toBe(0);
+    expect(requests).toContainEqual(expect.objectContaining({
+      action: 'remove',
+      id: f.task.id,
+      remoteRunnerSessionTool: true,
+      remoteRunnerControllerOpenId: 'ou_developer',
+    }));
+    expect(f.read()[f.task.id]).toBeUndefined();
+  });
+  it('rejects an invalid Remote Runner controller before contacting the daemon', async () => {
+    const f = fixture(); const requests: Array<Record<string, unknown>> = [];
+    await managed(f, undefined, 'om_live', requests);
+    delete f.env.BOTMUX_ORIGIN_CHANNEL_ID;
+    delete f.env.BOTMUX_READ_ISOLATION;
+    Object.assign(f.env, {
+      BOTMUX_HOST_RELAY_AUTHORIZED: '1',
+      BOTMUX_SESSION_ID: sid,
+      BOTMUX_TURN_ID: 'om_live',
+      BOTMUX_REMOTE_RUNNER_CONTROLLER_OPEN_ID: 'bad value',
+    });
+    const result = await f.run([
+      'add', '--schedule=10m', '--prompt=remote reminder', '--topic',
+      '--remote-runner-session-tool',
+    ]);
+    expect(result.code, result.output).not.toBe(0);
+    expect(result.output).toContain('controller identity is invalid');
+    expect(requests).toHaveLength(0);
+  });
+  it('keeps Remote Runner values opaque and preserves the frozen session scope', async () => {
+    const f = fixture(); await managed(f);
+    delete f.env.BOTMUX_ORIGIN_CHANNEL_ID;
+    delete f.env.BOTMUX_READ_ISOLATION;
+    Object.assign(f.env, {
+      BOTMUX_HOST_RELAY_AUTHORIZED: '1',
+      BOTMUX_SESSION_ID: sid,
+      BOTMUX_TURN_ID: 'om_live',
+    });
+    const before = Object.keys(f.read());
+    const result = await f.run([
+      'add', '--schedule=10m', '--prompt=--workdir=/tmp/evil',
+      '--name=--chat-id=oc_other_group', '--topic',
+      '--remote-runner-session-tool',
+    ]);
+    expect(result.code, result.output).toBe(0);
+    const added = Object.keys(f.read()).filter(id => !before.includes(id));
+    expect(added).toHaveLength(1);
+    expect(f.read()[added[0]]).toMatchObject({
+      prompt: '--workdir=/tmp/evil',
+      name: '--chat-id=oc_other_group',
+      workingDir: f.root,
+      chatId: 'oc_chat',
+      rootMessageId: 'om_root',
+      executionPosition: 'topic',
+    });
+  });
+  it('rejects the hidden Remote Runner schedule flag without host relay authority', async () => {
+    const f = fixture();
+    const result = await f.run(['list', '--remote-runner-session-tool']);
+    expect(result.code, result.output).not.toBe(0);
+    expect(result.output).toContain('requires the owning worker');
+  });
+  it.each(['BOTMUX_SESSION_ID', 'BOTMUX_TURN_ID'] as const)(
+    'rejects Remote Runner relay authority without frozen %s', async missing => {
+      const f = fixture();
+      Object.assign(f.env, {
+        BOTMUX_HOST_RELAY_AUTHORIZED: '1',
+        BOTMUX_SESSION_ID: sid,
+        BOTMUX_TURN_ID: 'om_live',
+      });
+      delete f.env[missing];
+      const result = await f.run(['list', '--remote-runner-session-tool']);
+      expect(result.code, result.output).not.toBe(0);
+      expect(result.output).toContain('missing its frozen session/turn');
+    },
+  );
   it('keeps the original creator-auth error when delegated add returns non-OK', async () => {
     const f = fixture();
     await managed(f, proof => { proof.scheduleCreator = { ok: false, error: 'caller_not_allowed' }; });
@@ -261,8 +495,11 @@ describe('schedule CLI prompt updates', () => {
     'preserves the old task when authorization is %s', async mode => {
       const f = fixture();
       await managed(f, (proof, index) => {
-        if (mode === 'denied' || (mode === 'permission-revoked' && index > 1)) proof.scheduleCreator = { ok: false, error: 'caller_not_allowed' };
-        if (mode === 'old-daemon') delete proof.scheduleCreator;
+        if (mode === 'denied' || (mode === 'permission-revoked' && index > 1)) {
+          proof.scheduleCreator = { ok: false, error: 'caller_not_allowed' };
+          proof.scheduleOperator = { ok: false, error: 'caller_not_allowed' };
+        }
+        if (mode === 'old-daemon') delete proof.scheduleOperator;
         if (mode === 'turn-rotated' && index > 1) proof.turnId = 'om_next';
         if (mode === 'cross-bot') proof.larkAppId = 'cli_other';
       });

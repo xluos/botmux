@@ -292,6 +292,7 @@ import * as sessionStore from '../src/services/session-store.js';
 import { sessionKey } from '../src/core/types.js';
 import type { DaemonSession } from '../src/core/types.js';
 import { logger } from '../src/utils/logger.js';
+import { mutatePersistedSessionRow } from './helpers/session-store-disk.js';
 
 beforeEach(() => {
   tempDir = mkdtempSync(join(tmpdir(), 'restore-zombie-test-'));
@@ -337,6 +338,50 @@ function makeActivePersistentSession(rootMessageId: string, backendType: 'tmux' 
   sessionStore.updateSession(s);
   return s; // left active
 }
+
+describe('restoreActiveSessions — recovery persistence isolation', () => {
+  it.each(['ordinary', 'readonly'] as const)('isolates a %s recovery attach failure and restores later sessions', async kind => {
+    const broken = makeActivePersistentSession('om_recovery_broken');
+    const healthy = makeActivePersistentSession('om_recovery_healthy');
+    const map = new Map<string, DaemonSession>();
+    wp.registry = map;
+    const attach = kind === 'ordinary' ? ensureOrdinaryTurnRecoveryAttached : ensureReadonlyTaskContinuationAttached;
+    vi.mocked(attach).mockImplementationOnce(() => { throw new Error('disk full during recovery attach'); });
+    await expect(restoreActiveSessions(map)).resolves.toBeUndefined();
+    expect(map.get(sessionKey('om_recovery_healthy', 'app_test'))?.session.sessionId).toBe(healthy.sessionId);
+    expect(sessionStore.getSession(broken.sessionId)?.status).toBe('active');
+    expect(ensureOrdinaryTurnRecoveryAttached).toHaveBeenCalledWith(expect.objectContaining({ session: expect.objectContaining({ sessionId: healthy.sessionId }) }));
+    expect(ensureReadonlyTaskContinuationAttached).toHaveBeenCalledWith(expect.objectContaining({ session: expect.objectContaining({ sessionId: healthy.sessionId }) }));
+    expect(logger.error).toHaveBeenCalledWith(expect.stringContaining('disk full during recovery attach'));
+  });
+});
+
+describe('restoreActiveSessions — workspace retirement', () => {
+  it.each(['tmux', 'zmx'] as const)('skips and explains a corrupt active retired %s row before registration or spawn', async backend => {
+    const session = makeActivePersistentSession('retired-root', backend);
+    const retirement = { operationId: 'recycle-corrupt', workspacePath: '/removed', retiredAt: new Date().toISOString() };
+    // Bypass the write invariant to model historical/corrupt durable data, then reload it.
+    mutatePersistedSessionRow(tempDir, 'app_test', session.sessionId, row => {
+      row.workspaceRetirement = retirement;
+    });
+    sessionStore.init('app_test');
+    expect(sessionStore.getSession(session.sessionId)).toMatchObject({ status: 'active', workspaceRetirement: retirement });
+    vi.mocked(setActiveSessionSafe).mockClear();
+    vi.mocked(forkAdoptWorker).mockClear();
+    vi.mocked(logger.info).mockClear();
+    const active = new Map<string, DaemonSession>();
+    wp.registry = active;
+
+    await restoreActiveSessions(active);
+
+    expect(active.size).toBe(0);
+    expect(setActiveSessionSafe).not.toHaveBeenCalled();
+    expect(forkWorker).not.toHaveBeenCalled();
+    expect(forkAdoptWorker).not.toHaveBeenCalled();
+    expect(logger.info).toHaveBeenCalledWith(expect.stringContaining(`Skipping workspace-retired session ${session.sessionId}`));
+    expect(logger.info).toHaveBeenCalledWith(expect.stringContaining(`operationId=${retirement.operationId}`));
+  });
+});
 
 describe('restoreActiveSessions — narrow XPI recovery containment', () => {
   function makePrincipalLaneSession(rootMessageId: string) {
@@ -997,7 +1042,7 @@ describe('restoreActiveSessions — persistent-backend zombie-close decision', (
     );
     expect(HerdrBackend.probeSession).not.toHaveBeenCalled();
     expect(closeSession).not.toHaveBeenCalled();
-    expect(forkWorker).toHaveBeenCalledWith(expect.objectContaining({ session: s }), '', true);
+    expect(forkWorker).toHaveBeenCalledWith(expect.objectContaining({ session: s }), '', true, { reattachLiveBackend: true });
   });
 
   it('isolates a collision-loser close refusal and continues restoring later rows', async () => {
@@ -1019,6 +1064,7 @@ describe('restoreActiveSessions — persistent-backend zombie-close decision', (
       expect.objectContaining({ session: expect.objectContaining({ sessionId: survivor.sessionId }) }),
       '',
       true,
+      { reattachLiveBackend: true },
     );
     expect(logger.error).toHaveBeenCalledWith(expect.stringContaining('ownership probe unavailable'));
   });
@@ -1107,7 +1153,7 @@ describe('restoreActiveSessions — persistent-backend zombie-close decision', (
 
     expect(ZmxBackend.probeSessions).toHaveBeenCalledTimes(2);
     expect(forkWorker).toHaveBeenCalledTimes(1);
-    expect(forkWorker).toHaveBeenCalledWith(expect.objectContaining({ session: expect.objectContaining({ sessionId: first.sessionId }) }), '', true);
+    expect(forkWorker).toHaveBeenCalledWith(expect.objectContaining({ session: expect.objectContaining({ sessionId: first.sessionId }) }), '', true, { reattachLiveBackend: true });
     expect(sessionStore.getSession(second.sessionId)!.status).toBe('active');
     expect(closeSession).not.toHaveBeenCalled();
   });
@@ -1195,7 +1241,7 @@ describe('restoreActiveSessions — persistent-backend zombie-close decision', (
     });
     const restored = map.get(sessionKey('om_cli_mismatch_pending', 'app_test'));
     expect(restored).toBeDefined();
-    expect(forkWorker).toHaveBeenCalledWith(restored, '', true);
+    expect(forkWorker).toHaveBeenCalledWith(restored, '', true, { reattachLiveBackend: true });
   });
 
   it('isolates a failed ZMX mismatch teardown and continues closing later sessions', async () => {
@@ -1443,6 +1489,36 @@ describe('restoreActiveSessions — persistent-backend zombie-close decision', (
     expect(map.get(sessionKey('om_exists', 'app_test'))).toBeDefined();
   });
 
+  it('only a backing session probed alive re-attaches past a deleted working directory', async () => {
+    // forkWorker refuses a start whose working directory is gone, except for
+    // this flag: an alive pane's CLI keeps running and is not respawned. A row
+    // that will cold-spawn (missing pane, durable activation) must not get it.
+    probe.result = 'exists';
+    const alive = makeActivePersistentSession('om_alive_flag');
+    const map = new Map<string, DaemonSession>();
+    wp.registry = map;
+    await restoreActiveSessions(map);
+    expect(vi.mocked(forkWorker).mock.calls.find(([ds]) => ds.session.sessionId === alive.sessionId)?.[3])
+      .toEqual({ reattachLiveBackend: true });
+
+    vi.mocked(forkWorker).mockClear();
+    probe.result = 'missing';
+    const coldSpawn = makeActivePersistentSession('om_missing_flag');
+    sessionStore.updateSession({
+      ...coldSpawn,
+      queuedActivationPending: true,
+      queuedActivationInput: 'held opening',
+      queuedActivationToken: 'tok-missing',
+      queuedActivationTurnId: 'om_missing_flag',
+    } as any);
+    const map2 = new Map<string, DaemonSession>();
+    wp.registry = map2;
+    await restoreActiveSessions(map2);
+    const call = vi.mocked(forkWorker).mock.calls.find(([ds]) => ds.session.sessionId === coldSpawn.sessionId);
+    expect(call).toBeDefined();
+    expect(call![3]).toBeUndefined();
+  });
+
   // ── blocker #3d: a sandbox session persisted as adopt must be CONVERTED to a
   // plain cold-start at restore, not re-registered as a (worker=null) adopt. ──
   it('sandbox adopt session on restore → converted to cold-start (no adopt fork, title normalized, row not adopt, survives next restart)', async () => {
@@ -1451,6 +1527,7 @@ describe('restoreActiveSessions — persistent-backend zombie-close decision', (
     s.sandbox = true; // frozen sandbox decision
     s.title = 'Adopt: proj';
     s.adoptedFrom = { source: 'tmux', tmuxTarget: 'ext:0.0', originalCliPid: 111, cliId: 'claude-code', cwd: '/tmp/proj' } as any;
+    s.cliConfigDir = '~/.claude-api'; // frozen onto the adopt row by an older build
     sessionStore.updateSession(s);
     const map = new Map<string, DaemonSession>();
     wp.registry = map;
@@ -1461,6 +1538,8 @@ describe('restoreActiveSessions — persistent-backend zombie-close decision', (
     expect(forkAdoptWorker).not.toHaveBeenCalled();
     const persisted = sessionStore.getSession(s.sessionId)!;
     expect(persisted.adoptedFrom).toBeUndefined();
+    // the cold start resumes the external transcript on the default data root
+    expect(persisted.cliConfigDir).toBeUndefined();
     expect(persisted.title).not.toMatch(/^Adopt:/);
     // registered as an ordinary restored session (row announced, not closed)
     expect(closeSession).not.toHaveBeenCalledWith(s.sessionId);
@@ -1512,7 +1591,7 @@ describe('restoreActiveSessions — persistent-backend zombie-close decision', (
     expect(restored.session.lastCodexAppInput).toEqual(expected);
     expect(restored.lastUserPrompt).toBe('第 20 轮用户原文');
     expect(restored.lastCliInput).toContain('第 20 轮用户原文');
-    expect(forkWorker).toHaveBeenCalledWith(restored, '', true);
+    expect(forkWorker).toHaveBeenCalledWith(restored, '', true, { reattachLiveBackend: true });
     expect(sessionStore.getSession(s.sessionId)?.lastCodexAppInput).toEqual(expected);
   });
 
@@ -1548,7 +1627,7 @@ describe('restoreActiveSessions — persistent-backend zombie-close decision', (
     const canonical = map.get(sessionKey('om_pending_collision', 'app_test'))!;
     expect(canonical.session.sessionId).toBe(first.sessionId);
     expect(forkWorker).toHaveBeenCalledTimes(1);
-    expect(forkWorker).toHaveBeenCalledWith(canonical, '', true);
+    expect(forkWorker).toHaveBeenCalledWith(canonical, '', true, { reattachLiveBackend: true });
   });
 });
 

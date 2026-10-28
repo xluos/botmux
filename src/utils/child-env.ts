@@ -177,6 +177,13 @@ export const INVOKER_TERMINAL_ENV_KEYS = [
   'TERM_PROGRAM',
   'TERM_PROGRAM_VERSION',
   'TERM_SESSION_ID',
+  // Orca pins these to the relay version that launched the invoking terminal.
+  // Keeping them in a daemon bypasses the updated ~/.orca-relay/bin/orca
+  // defaults after Orca reconnects or upgrades, so /adopt queries a stale socket.
+  'ORCA_RELAY_DIR',
+  'ORCA_RELAY_SOCKET_PATH',
+  'ORCA_RELAY_CREDENTIAL_FILE',
+  'ORCA_RELAY_NODE_PATH',
   // CI / agent-harness flags
   'CI',
   'CODEX_CI',
@@ -266,6 +273,13 @@ export const REDACTED_CHILD_ENV_KEYS = [
   // boundary is safe. Kept as a string literal (like the keys above) with a
   // drift-guard test pinning it to PM2_GRACEFUL_EXIT_CODE_ENV.
   'BOTMUX_PM2_GRACEFUL_EXIT_CODE',
+  // Daemon-only LinkRef rollout authority. Workers and CLI children receive
+  // only the frozen typed turn mode through authenticated IPC.
+  'BOTMUX_LINK_REFS_MODE',
+  // Set only on the narrow host relay re-exec after it has authenticated the
+  // exact live turn. An ordinary child must not inherit or replay either bit.
+  'BOTMUX_LINK_REF_TURN_MODE',
+  'BOTMUX_HOST_RELAY_AUTHORIZED',
 ] as const;
 
 /**
@@ -359,6 +373,12 @@ export const BOTMUX_INJECTED_ENV_KEYS = [
   'BOTMUX_AIDEN_CODEX_PARENT_PATH',
   'BOTMUX_AIDEN_CODEX_REAL_BIN',
   'BOTMUX_AIDEN_CODEX_REASONING_EFFORT',
+  // Path to the per-launch file holding the Codex shell_environment_policy
+  // overrides the aiden-codex PATH shim re-injects past Aiden's argv gate.
+  // Scrub like the other shim keys: the path embeds the session data dir and
+  // a stale value in a co-tenant pane would point the shim at another
+  // session's identity file.
+  'BOTMUX_AIDEN_CODEX_SHELL_CONFIG_FILE',
   'SESSION_DATA_DIR',
   'IS_SANDBOX',
   // botmux ask/hooks use these to locate the daemon and route back to the
@@ -417,6 +437,7 @@ export const BOTMUX_INJECTED_ENV_KEYS = [
   // ('streaming' | 'footer' | 'off'). Injected explicitly so sandboxed offline
   // fallback cannot drift to the default when bots.json is unreadable.
   'BOTMUX_USAGE_DISPLAY',
+  'BOTMUX_REPLY_FOOTER',
   // Normalized sparse reply-style snapshot. Shared/native skill loaders and
   // `botmux send` consume this same session value; it must never enter a
   // co-tenant tmux server's ambient environment.
@@ -470,19 +491,14 @@ export const BOTMUX_INJECTED_ENV_KEYS = [
   // every governed call silently resolves the real tool and runs as the machine
   // account.
   'BOTMUX_IDENTITY_BIN',
+  'BOTMUX_LARK_TOOL_BINDING',
   'ZDOTDIR',
   'BASH_ENV',
   // Git attribution for the acting person. Same reason: askpass and the
   // per-host credential config are set on childEnv, which a tmux pane does not
   // inherit, so a push would carry the machine's identity instead.
   'GIT_ASKPASS',
-  // gitIdentityConfigEnv emits exactly three entries, so the numbered keys are
-  // a fixed set (0..2). Listed literally because this allowlist is exact-match:
-  // a prefix rule here would widen what any session can push into a pane.
   'GIT_CONFIG_COUNT',
-  'GIT_CONFIG_KEY_0', 'GIT_CONFIG_VALUE_0',
-  'GIT_CONFIG_KEY_1', 'GIT_CONFIG_VALUE_1',
-  'GIT_CONFIG_KEY_2', 'GIT_CONFIG_VALUE_2',
   // Hermes profile roots must match the worker-side transcript reader.
   'HERMES_HOME',
   'HERMES_BOTMUX_SOURCE_HOME',
@@ -546,8 +562,10 @@ export const SESSION_TURN_MARKER_ENV_KEYS = [
   '__OWNER_OPEN_ID',
   // Unguessable pane/profile authority channel (daemon-rotated capability).
   'BOTMUX_ORIGIN_CHANNEL_ID',
-  // Sandbox send-relay directory — a per-session capability path.
+  // Sandbox send-relay directory — a per-session capability path — and the
+  // credential-only "relay serves `send` only" scope marker that rides with it.
   'BOTMUX_SEND_RELAY',
+  'BOTMUX_SEND_RELAY_SCOPE',
   // Session-scoped MCP gateway capability + fail-closed marker.
   'BOTMUX_MCP_GATEWAY_SOCKET',
   'BOTMUX_MCP_GATEWAY_REQUIRED',
@@ -565,6 +583,7 @@ export const SESSION_TURN_MARKER_ENV_KEYS = [
   // Per-bot usage display, resolved via resolveUsageDisplay(cfg) per session;
   // env is never a config input for it.
   'BOTMUX_USAGE_DISPLAY',
+  'BOTMUX_REPLY_FOOTER',
   // Spawn-time normalized reply style; unset/scrub at every session boundary to
   // avoid cross-bot guide/card drift through a shared persistent backend.
   'BOTMUX_REPLY_STYLE',
@@ -599,6 +618,7 @@ export function isCliIdentityPath(value: string | undefined): boolean {
 }
 
 export function scrubCliIdentityEnv(env: NodeJS.ProcessEnv): void {
+  delete env.BOTMUX_LARK_TOOL_BINDING;
   const bin = env.BOTMUX_IDENTITY_BIN?.replace(/[\\/]+$/, '');
   const managed = (value: string | undefined): boolean => !!value && (
     isCliIdentityPath(value) || !!bin && (value === bin || value.startsWith(`${bin}/`) || value.startsWith(`${bin}\\`))
@@ -610,7 +630,7 @@ export function scrubCliIdentityEnv(env: NodeJS.ProcessEnv): void {
   if (managed(env.GIT_ASKPASS)) {
     // These entries are emitted together by gitIdentityConfigEnv for the turn.
     for (const key of Object.keys(env)) {
-      if (/^GIT_CONFIG_(?:COUNT|KEY_\d+|VALUE_\d+)$/.test(key)) delete env[key];
+      if (key === 'GIT_CONFIG_COUNT' || GIT_CONFIG_PAIR_ENV_KEY.test(key)) delete env[key];
     }
   }
   for (const key of ['ZDOTDIR', 'BASH_ENV', 'GIT_ASKPASS']) {
@@ -685,13 +705,26 @@ const TMUX_SERVER_GLOBAL_SCRUB_KEYS: ReadonlySet<string> = new Set([
 ]);
 
 /**
+ * Plain pattern source (no anchors) for the numbered git config transport
+ * pairs `GIT_CONFIG_KEY_<n>` / `GIT_CONFIG_VALUE_<n>`. Shared, in this one
+ * string, by the JS predicate below AND the pane wrapper's `sed -E` snippet:
+ * never slice a RegExp.source into shell code (a changed flag/anchor there
+ * would fail silently in the shell).
+ */
+export const GIT_CONFIG_PAIR_ENV_SHELL_PATTERN = 'GIT_CONFIG_(KEY|VALUE)_[0-9]+';
+
+/** Numbered git config pair names carried in the environment. */
+export const GIT_CONFIG_PAIR_ENV_KEY = new RegExp(`^${GIT_CONFIG_PAIR_ENV_SHELL_PATTERN}$`);
+
+/**
  * True for any env key botmux must keep out of the tmux CLIENT env it hands to
  * the `tmux` binary. This is stricter than server-global scrub: besides
- * botmux-owned routing/profile vars, we also strip daemon-side GitHub tokens so
- * a botmux-started tmux server never seeds them into its shared global env.
+ * botmux-owned routing/profile vars, we also strip daemon-side GitHub tokens
+ * and any numbered git config pairs so a botmux-started tmux server never
+ * seeds them into its shared global env.
  */
 export function isBotmuxManagedTmuxEnvKey(key: string): boolean {
-  return key.startsWith('BOTMUX') || TMUX_CLIENT_STRIP_KEYS.has(key);
+  return key.startsWith('BOTMUX') || TMUX_CLIENT_STRIP_KEYS.has(key) || GIT_CONFIG_PAIR_ENV_KEY.test(key);
 }
 
 /**
@@ -699,6 +732,13 @@ export function isBotmuxManagedTmuxEnvKey(key: string): boolean {
  * SERVER global environment. This intentionally excludes user-wide GitHub
  * tokens: botmux panes must `unset` them locally, but daemon startup must not
  * rewrite a shared tmux server's general-purpose env table.
+ *
+ * The numbered git config pairs are deliberately NOT matched here: a shared
+ * server the user owns can legitimately hold their own `GIT_CONFIG_KEY_<n>`.
+ * Deleting those would rewrite the user's server env the same way the
+ * user-wide token carve-out forbids. Panes strip the pairs locally instead
+ * (see the pane wrapper unset clause), and the per-pane env(1) prefix
+ * re-publishes only the turn-authored pair set.
  */
 export function isBotmuxManagedTmuxServerGlobalEnvKey(key: string): boolean {
   return key.startsWith('BOTMUX') || TMUX_SERVER_GLOBAL_SCRUB_KEYS.has(key);

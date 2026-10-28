@@ -9,8 +9,11 @@ import { pendingStartingCardPublication } from '../src/core/starting-card-public
  * Run:  pnpm vitest run test/recall-frozen-cards.test.ts
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { appendFileSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { homedir, tmpdir } from 'node:os';
+import { dirname, join } from 'node:path';
 import type { DaemonSession, FrozenCard } from '../src/core/types.js';
-import { activeSessionKey, sessionKey } from '../src/core/types.js';
+import { activeSessionKey, sessionAnchorId, sessionKey } from '../src/core/types.js';
 import { setTerminalProxyPort } from '../src/core/terminal-url.js';
 
 // ─── Mocks ─────────────────────────────────────────────────────────────────
@@ -138,6 +141,8 @@ import {
   refreshStreamingCardUsage,
   syncUsageRefreshTimer,
   USAGE_REFRESH_INTERVAL_MS,
+  canRestoreStreamingCardIdentity,
+  restoreStreamingCardIdentityFromProof,
 } from '../src/core/worker-pool.js';
 import { MessageWithdrawnError, MessageUpdateExpiredError } from '../src/im/lark/client.js';
 import { buildStreamingCard } from '../src/im/lark/card-builder.js';
@@ -1530,15 +1535,31 @@ describe('refreshStreamingCardUsage (interval tick)', () => {
   });
 
   it('reads usage fresh so the 12s tick beats the 15s cost-reader throttle', () => {
-    // The whole point of the tick is to break the reparse throttle. The 17th
-    // buildStreamingCard arg is the streaming usage snapshot; assert the tick
-    // asked for a fresh read (empty transcript here → concrete empty snapshot).
+    // The whole point of the tick is to break the reparse throttle: two ticks
+    // inside one throttle window must both see the transcript as it is now.
+    // The 17th buildStreamingCard arg is the streaming usage snapshot.
+    const cwd = realpathSync(mkdtempSync(join(tmpdir(), 'usage-fresh-')));
+    const cliSessionId = 'usage-fresh-sid';
+    const transcript = join(homedir(), '.claude', 'projects', cwd.replace(/[^A-Za-z0-9-]/g, '-'), `${cliSessionId}.jsonl`);
+    mkdirSync(dirname(transcript), { recursive: true });
+    const assistant = (id: string, input: number) => JSON.stringify({
+      type: 'assistant',
+      message: { id, model: 'claude-sonnet-4-20250514', usage: { input_tokens: input, output_tokens: 1 } },
+    });
+    writeFileSync(transcript, `${assistant('msg_a', 100)}\n`);
     const ds = workingDs();
+    ds.workingDir = cwd;
+    ds.session.cliSessionId = cliSessionId;
+
     refreshStreamingCardUsage(ds);
-    const call = buildStreamingCardMock.mock.calls[0]!;
-    // Snapshot present (17th positional arg) and interval < throttle by design.
-    expect(call[16]).toEqual({ context: null, tokens: null, turnTokens: null });
+    appendFileSync(transcript, `${assistant('msg_b', 200)}\n`);
+    refreshStreamingCardUsage(ds);
+
+    const [first, second] = buildStreamingCardMock.mock.calls.map(call => call[16]);
+    expect(first.tokens).toMatchObject({ inputTokens: 100 });
+    expect(second.tokens).toMatchObject({ inputTokens: 300 });
     expect(USAGE_REFRESH_INTERVAL_MS).toBeLessThan(15_000);
+    rmSync(cwd, { recursive: true, force: true });
   });
 
   it('renders an empty terminal URL for a port=0 backend (ZMX) — no fake `:undefined` link', () => {
@@ -1675,5 +1696,148 @@ describe('syncUsageRefreshTimer (state-boundary arm/clear)', () => {
     const before = buildStreamingCardMock.mock.calls.length;
     vi.advanceTimersByTime(USAGE_REFRESH_INTERVAL_MS);
     expect(buildStreamingCardMock.mock.calls.length).toBe(before + 1);
+  });
+});
+
+// ─── Publication proof for display-toggle card restoration ──────────────────
+
+describe('lastPublishedStreamingCardIdentity (publication proof)', () => {
+  it('postTurnStartingCard records the exact posted card, nonce, route and turn generation', async () => {
+    const ds = makeDs();
+    ds.workerReady = true;
+    ds.streamCardPending = true;
+    ds.streamCardTurnGeneration = 7;
+    ds.streamCardPendingTurnId = 'om_turn_7';
+    activate(ds);
+    const sessionReply = vi.fn(async () => 'om_turn_card_7');
+
+    await expect(postTurnStartingCard(ds, sessionReply, 'om_turn_7')).resolves.toBe(true);
+
+    expect(ds.lastPublishedStreamingCardIdentity).toEqual({
+      messageId: 'om_turn_card_7',
+      nonce: ds.streamCardNonce,
+      sessionId: SESSION_ID,
+      larkAppId: APP_ID,
+      anchorId: sessionAnchorId(ds),
+      runtimeKey: activeSessionKey(ds),
+      turnGeneration: 7,
+    });
+  });
+
+  it('a POST superseded by a newer turn is recorded under its own generation (never restorable for the newer turn)', async () => {
+    const ds = makeDs();
+    ds.workerReady = true;
+    ds.streamCardPending = true;
+    ds.streamCardTurnGeneration = 1;
+    ds.streamCardPendingTurnId = 'om_turn_1';
+    activate(ds);
+    const resolvers: Array<(id: string) => void> = [];
+    const sessionReply = vi.fn(() => new Promise<string>((resolve) => { resolvers.push(resolve); }));
+    const posting = postTurnStartingCard(ds, sessionReply as any, 'om_turn_1');
+    await Promise.resolve();
+    expect(resolvers).toHaveLength(1);
+    // Newer turn accepted while the first POST is in flight.
+    ds.streamCardTurnGeneration = 2;
+    ds.streamCardPendingTurnId = 'om_turn_2';
+    resolvers[0]('om_turn_card_1');
+    await posting;
+    // First card committed, recorded under ITS generation; the successor's
+    // POST is now in flight (sentinel), so nothing can restore card 1.
+    expect(ds.lastPublishedStreamingCardIdentity).toMatchObject({ messageId: 'om_turn_card_1', turnGeneration: 1 });
+    expect(ds.streamCardTurnGeneration).toBe(2);
+    await flush();
+    expect(resolvers).toHaveLength(2);
+    resolvers[1]('om_turn_card_2');
+    await flush();
+    await flush();
+    expect(ds.streamCardId).toBe('om_turn_card_2');
+    expect(ds.lastPublishedStreamingCardIdentity).toMatchObject({ messageId: 'om_turn_card_2', turnGeneration: 2 });
+  });
+
+  it('postFreshStreamingCard (/card, legacy migration) records the proof', async () => {
+    const ds = makeDs();
+    ds.workerReady = true;
+    activate(ds);
+    const sessionReply = vi.fn(async () => 'om_fresh_card');
+    await expect(postFreshStreamingCard(ds, sessionReply)).resolves.toBe(true);
+    expect(ds.lastPublishedStreamingCardIdentity).toMatchObject({
+      messageId: 'om_fresh_card', nonce: ds.streamCardNonce, sessionId: SESSION_ID,
+    });
+  });
+
+  it('a failed POST does not record a proof', async () => {
+    const ds = makeDs();
+    ds.workerReady = true;
+    activate(ds);
+    const sessionReply = vi.fn(async () => { throw new Error('post failed'); });
+    await expect(postFreshStreamingCard(ds, sessionReply)).resolves.toBe(false);
+    expect(ds.lastPublishedStreamingCardIdentity).toBeUndefined();
+  });
+
+  it('a withdrawn/expired PATCH of the proven card drops the proof; an unrelated card does not', async () => {
+    const ds = makeDs();
+    // The PATCH fence requires the session to retain its active registry slot.
+    activate(ds);
+    ds.streamCardId = 'om_PROVEN';
+    ds.streamCardNonce = 'nonce';
+    ds.lastPublishedStreamingCardIdentity = {
+      messageId: 'om_PROVEN', nonce: 'nonce', sessionId: SESSION_ID, larkAppId: APP_ID,
+      anchorId: sessionAnchorId(ds), runtimeKey: activeSessionKey(ds), turnGeneration: 0,
+    };
+    updateMessageMock.mockImplementationOnce(async () => { throw new MessageUpdateExpiredError('om_OTHER'); });
+    ds.streamCardId = 'om_OTHER';
+    scheduleCardPatch(ds, '{"a":1}');
+    await flush();
+    expect(ds.lastPublishedStreamingCardIdentity?.messageId).toBe('om_PROVEN');
+
+    ds.streamCardId = 'om_PROVEN';
+    updateMessageMock.mockImplementationOnce(async () => { throw new MessageWithdrawnError('om_PROVEN'); });
+    scheduleCardPatch(ds, '{"a":2}');
+    await flush();
+    expect(ds.streamCardId).toBeUndefined();
+    expect(ds.lastPublishedStreamingCardIdentity).toBeUndefined();
+  });
+
+  it('tracks the exact in-flight PATCH target and clears it in finally (pendingCardId is not evidence)', async () => {
+    const ds = makeDs();
+    ds.streamCardId = 'om_TARGET';
+    let resolvePatch!: () => void;
+    updateMessageMock.mockImplementationOnce(() => new Promise<void>((resolve) => { resolvePatch = resolve; }));
+    scheduleCardPatch(ds, '{"a":1}');
+    expect(ds.pendingCardId).toBeUndefined();
+    expect(ds.cardPatchInFlight).toBe(true);
+    expect(ds.cardPatchInFlightMessageId).toBe('om_TARGET');
+    resolvePatch();
+    await flush();
+    expect(ds.cardPatchInFlight).toBe(false);
+    expect(ds.cardPatchInFlightMessageId).toBeUndefined();
+  });
+
+  it('strict restore helper: exact proof restores; same nonce on another message does not', () => {
+    const ds = makeDs();
+    ds.scope = 'chat';
+    ds.streamCardNonce = 'nonce_N';
+    ds.streamCardTurnGeneration = 2;
+    activate(ds);
+    ds.lastPublishedStreamingCardIdentity = {
+      messageId: 'om_A', nonce: 'nonce_N', sessionId: SESSION_ID, larkAppId: APP_ID,
+      anchorId: sessionAnchorId(ds), runtimeKey: activeSessionKey(ds), turnGeneration: 2,
+    };
+    const claim = { clickedNonce: 'nonce_N', actionSessionId: SESSION_ID, actionRootId: sessionAnchorId(ds) };
+    expect(canRestoreStreamingCardIdentity(ds, { ...claim, messageId: 'om_B' })).toBe(false);
+    expect(canRestoreStreamingCardIdentity(ds, { ...claim, messageId: 'om_A', clickedNonce: undefined })).toBe(false);
+    expect(canRestoreStreamingCardIdentity(ds, { ...claim, messageId: 'om_A', actionSessionId: undefined })).toBe(false);
+    expect(canRestoreStreamingCardIdentity(ds, { ...claim, messageId: 'om_A', actionRootId: 'om_root_other' })).toBe(false);
+    // Registry not owned → refused.
+    setActiveSessionsRegistry(new Map());
+    expect(canRestoreStreamingCardIdentity(ds, { ...claim, messageId: 'om_A' })).toBe(false);
+    activate(ds);
+    ds.cardPatchInFlight = true;
+    expect(canRestoreStreamingCardIdentity(ds, { ...claim, messageId: 'om_A' })).toBe(false);
+    ds.cardPatchInFlight = false;
+    expect(restoreStreamingCardIdentityFromProof(ds, { ...claim, messageId: 'om_A' })).toBe(true);
+    expect(ds.streamCardId).toBe('om_A');
+    // Never overwrites an existing id (including the POST sentinel).
+    expect(canRestoreStreamingCardIdentity(ds, { ...claim, messageId: 'om_A' })).toBe(false);
   });
 });

@@ -17,6 +17,8 @@ botmux schedule add "每日18:00" "检查部署状态" --topic
 
 `--topic` 可从当前话题会话推断锚点，也可用 `--root-msg-id <om_...>` 指定目标话题。
 
+真人管理员直接在当前对话中要求创建或管理任务，不依赖 `scheduleDelegation.createEnabled`。daemon 从当前有效回合的发送者证据确定操作者；即使 CLI 就绪时清除了忙闲状态中的临时 caller，也只恢复同一条真人消息的身份，并继续校验实时回合授权。会话 Owner、历史消息、机器人发送者和复制上下文的自动续跑不能代替本轮真人授权。
+
 ## 跨 Bot 委托创建
 
 当真人在 Bot A 的当前回合中明确要求 Bot B 建立定时任务时，A 必须在受管派发中显式请求：
@@ -69,7 +71,15 @@ scheduled turn 不从未受管工具继承机器登录态，目标 Bot 必须同
 
 `runScopes` 默认空；配置为 `["bytedcli"]` 后，委托任务可在未来每次触发时使用原真人的 bytedcli 授权。来源 Bot 和目标 Bot 都必须启用 `triggerUserAuth`，且目标 Bot 应让 `lark-cli`、`bytedcli` 都经过隔离 wrapper，以保证复用会话不会继承历史身份；否则创建或执行会 fail-closed。该能力不会让 scheduled turn 变成通用真人 current actor，也不会持久化 lark-cli 权限。
 
-`selfManageEnabled:true` 允许 delegated scheduled turn 用 `botmux schedule pause self` 或 `botmux schedule remove self` 停止当前任务，不能修改 prompt/目标、恢复或强制运行任务，也不能管理其他任务或创建后继任务。`createEnabled:false` 只停止新签发，`runEnabled:false` 撤销已有委托任务的后续运行；删除 `runScopes` 或关闭 `selfManageEnabled` 会分别收回对应的持久权限。
+真人当前回合创建的 direct 任务，其 scheduled turn 可用 `botmux schedule pause self` 或 `botmux schedule remove self` 停止当前任务。跨 Bot delegated 任务仍需 `selfManageEnabled:true`。两类任务都只能管理当前精确 task，不能修改 prompt/目标、恢复或强制运行任务，也不能管理其他任务或创建后继任务。`createEnabled:false` 只停止新签发，`runEnabled:false` 撤销已有委托任务的后续运行；删除 `runScopes` 或关闭 `selfManageEnabled` 会分别收回 delegated task 的对应持久权限。
+
+需要先发送最终结果再删除自身时，使用一个单一收口命令：
+
+```bash
+botmux send --response-kind final --schedule-remove-self --no-mention "任务已完成"
+```
+
+BotMux 会先确认 final 已成功投递并落账，再通过 owning daemon 删除当前 scheduled task，最后推进长驻 CLI 的排队 turn。不要拆成“先发 final、再执行 `schedule remove self`”，因为 final 之后当前进程可能已经切到下一排队 turn，旧身份会被安全拒绝。该 flag 只接受当前 scheduled turn 的标准 final，task ID 由 daemon 绑定的 turn 推导，调用方不能指定或删除其他任务。若结构化结果中的 `scheduleSelfCleanup.removed` 为 `false`，原样重试同一命令即可：BotMux 会复用已投递的 final，只补做自删，不会重复发消息。
 
 任务定义、授权、启停/完成状态和运行 claim 以宿主侧 SQLite 为准，`schedules.json` 只是可重建投影。首次升级会把当时已有任务清单一次性登记为 legacy；之后新增、复制或改写 JSON 记录不会获得执行资格。该边界保护受管 CLI 与文件沙盒，不承诺抵御能以同一系统用户任意读取宿主密钥和授权库的进程。
 
@@ -242,6 +252,45 @@ Dashboard 的「定时任务」页也有这两个字段，留空即跟随 Bot �
 
 支持的 CLI 是 Codex、Claude Code、Grok、TraeX（与 Trigger API `options.model` 同一套门禁）；其它 CLI 的任务会在触发时忽略这两个字段并记一条 warn。思考强度的可选等级取决于模型（如 `gpt-5.6-sol` 六档到 `ultra`，`gpt-5.5` 只到 `xhigh`），Dashboard 保存时会直接拒绝不支持的组合；如果任务存好之后 Bot 换了 CLI、或模型不再支持该等级，触发时会**丢掉这一项照常执行**并记 warn——不会因为配置过期就跳过一次执行。
 
+## 跟进任务：直到完成
+
+「等 PR 合入后切回主干」「10 月 30 日之后删掉备份」这类事，用 `--until-done` 建一个**有状态**的任务：没做完就按计划继续执行，执行它的会话确认做完后标记完成，任务才结束。
+
+```bash
+# 每天 10:07 检查一次，最晚到 11 月 20 日
+botmux schedule add "7 10 * * *" "PR #123 合入后，把集群切回 upstream 并清理临时 worktree" \
+  --until-done --deadline 2026-11-20 --silent
+
+# 某天之后去做；没做成每 6 小时再试（一次性任务默认 1 天）
+botmux schedule add "2026-10-30T10:00" "删除升级前的备份目录" --until-done --retry-every 6h
+
+# 执行会话确认做完后（先标记，再发最终答复）
+botmux schedule done self --note "已切回 upstream，worktree 已清理"
+```
+
+| 情况 | 普通任务 | `--until-done` 任务 |
+| --- | --- | --- |
+| 执行成功投递 | 一次性任务随即停用 | 不停用；一次性任务隔 `--retry-every` 再执行 |
+| 执行出错 / daemon 重启打断 | 一次性任务随即停用 | 不停用；一次性任务最迟 1 小时后重试，循环任务等下一次 |
+| 错过准点（daemon 停机等） | 跳到下一次 | 立即补跑一次，再接上正常节奏 |
+| 到达 `--deadline` | — | 立即做最后一次收尾执行（prompt 会注明），之后关闭为「已到期」。收尾失败会按 60 分钟重试（最多 3 次，之后仍关闭为「已到期」），重试期间常规计划暂停 |
+| `botmux schedule done` | 不适用 | 关闭为「已完成」，记下结果说明 |
+
+每次执行时，prompt 末尾会自动附上第几次执行、截止时间和标记完成的方法，任务 prompt 只需写清「等什么、做什么」。已完成或已到期的任务不能 `resume`，需要继续就新建。机器人代为创建的委托任务暂不支持 `--until-done`。
+
+**执行账本**：所有定时任务都会记录执行、跳过（前置条件 / 工作日历）、失败、错过准点的次数以及连续失败次数，`botmux schedule list` 每个任务下多两行：
+
+```
+   状态: 直到完成 · 进行中 · 已执行 3 次 · 截止 2026/11/20 00:00:00
+   账本: 执行 3 · 跳过 0 · 失败 1 · 错过 1（最近 2026/10/26 10:07:00）
+```
+
+日历读取失败（如日历文件损坏）按一次失败执行记账（跳过仅指前置条件不满足或日历标注的休息日），连续 3 次会计入连败并触发 `--notify failing` 通知。
+
+**按需通知**：`--notify failing,expired` 在创建任务的话题（没有话题则在执行群）@ 创建人——`failing` 是连续失败 3 次时（每轮连续失败只通知一次），`expired` 是任务到期关闭时。默认不通知。
+
+**管理员兜底告警**：与上面的按需通知相互独立——任一定时任务（无论是否配置 `--notify`）连续失败 3 次时，系统还会私信一位管理员一次（成功恢复后自动解除）；日历连续读取失败计入同一条连败串，也会触发该告警。
+
 ## 管理
 
 ```bash
@@ -264,6 +313,8 @@ botmux schedule update <id> --prompt "新的完整提示词"
 文件按 UTF-8 读取，保留换行。更新只修改 prompt，保留任务 ID、定时规则、启停状态、执行位置和运行记录；不触发补跑。已经开始的执行继续使用原 prompt，后续执行采用新版。输入或权限校验失败不会删除旧任务；更新使用与其他任务操作相同的加锁原子存储。
 
 在定时任务创建的无 owner 话题中，Botmux 通过宿主 daemon 验证当前操作者，无需向沙盒开放机器人配置或凭据。CLI 与 daemon 应配套升级；旧 daemon 缺少此授权能力时会明确拒绝，而不会删除任务或绕过验证。
+
+操作已有任务（运行、暂停、恢复、删除或更新）按当前机器人内的授权判断：宿主从有效回合取得发起人的 `open_id`，并核对本机器人实时允许的操作者；不要求白名单另有 `union_id` 映射。任务所属 Bot、当前会话、轮次和权限仍须匹配。此检查与新建任务的稳定归属绑定分离；不会让机器人消息、旧回合、跨 Bot 的 `open_id` 或调用方自报身份获得权限。新建任务和跨 Bot 委托原有的归属规则不变。
 
 绑定了守护前置条件（precondition）的任务不能用 `update` 修改：前置条件记录了任务输入的校验哈希，而其定义文件保存在宿主侧、沙盒内无法重绑；直接改 prompt 会让任务之后每次触发都校验失败、静默停止。这类任务请在 Dashboard 的定时任务页修改。
 

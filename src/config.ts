@@ -1,5 +1,6 @@
 import { networkInterfaces } from 'node:os';
 import type { BackendType } from './adapters/backend/types.js';
+import { normalizeHerdrBackendConfig } from './adapters/backend/types.js';
 import { resolveBotmuxDataDir } from './core/data-dir.js';
 import { resolveWorkerHttpHost } from './utils/worker-http.js';
 import {
@@ -256,13 +257,7 @@ export function resolveRecoveryForkConfig(env: NodeJS.ProcessEnv = process.env):
 const recoveryForkConfig = resolveRecoveryForkConfig();
 
 function resolvePositiveRuntimeTimeout(raw: string | undefined, fallback: number): number {
-  const normalized = raw?.trim();
-  if (!normalized) return fallback;
-
-  const value = Number(normalized);
-  return Number.isFinite(value) && value > 0 && value <= MAX_TIMER_DELAY_MS
-    ? value
-    : fallback;
+  return parseBoundedInteger(raw, fallback, 1, MAX_TIMER_DELAY_MS);
 }
 
 export function resolveStuckDetectorTimeoutMs(env: NodeJS.ProcessEnv = process.env): number {
@@ -274,10 +269,6 @@ export function resolveWorktreeSlugAiTimeoutMs(env: NodeJS.ProcessEnv = process.
 }
 
 export const config = {
-  lark: {
-    appId: process.env.LARK_APP_ID ?? '',
-    appSecret: process.env.LARK_APP_SECRET ?? '',
-  },
   session: {
     get dataDir() { return process.env.SESSION_DATA_DIR ?? fallbackDataDir(); },
     // Writable for back-compat: callers/tests historically assigned
@@ -294,7 +285,6 @@ export const config = {
   },
   daemon: {
     cliId: (process.env.CLI_ID ?? 'claude-code') as import('./adapters/cli/types.js').CliId,
-    cliPathOverride: process.env.CLI_PATH,
     backendType: (process.env.BACKEND_TYPE ?? detectDefaultBackend()) as BackendType,
     /** Auto-recovery throttle: on restart every surviving persistent-backend
      *  session is eagerly re-forked to re-attach its pane. With dozens of
@@ -307,7 +297,14 @@ export const config = {
     forwardFollowupWaitMs: resolveForwardFollowupWaitMs(),
     workingDir: (process.env.WORKING_DIR ?? '~').split(',').map(s => s.trim()).filter(Boolean)[0] || '~',
     workingDirs: (process.env.WORKING_DIR ?? '~').split(',').map(s => s.trim()).filter(Boolean),
-    allowedUsers: (process.env.ALLOWED_USERS ?? '').split(',').map(s => s.trim()).filter(Boolean),
+    herdr: normalizeHerdrBackendConfig({
+      sessionName: process.env.BOTMUX_HERDR_SESSION_NAME,
+      placement: process.env.BOTMUX_HERDR_PLACEMENT,
+      workspace: process.env.BOTMUX_HERDR_WORKSPACE,
+      tab: process.env.BOTMUX_HERDR_TAB,
+      splitDirection: process.env.BOTMUX_HERDR_SPLIT_DIRECTION,
+      chatTypes: process.env.BOTMUX_HERDR_CHAT_TYPES,
+    }),
   },
   web: {
     host: process.env.WEB_HOST ?? '0.0.0.0',
@@ -401,11 +398,10 @@ export const config = {
   // cached) on each access so a Settings change takes effect without a daemon
   // restart. The daemon's listChatBotMembers reads this per call.
   get chatBotDiscovery() { return resolveChatBotDiscoveryConfig(); },
-  get herdrTraexPlugin() { return resolveHerdrTraexPluginConfig(); },
   // Live getter (like chatBotDiscovery): re-reads the experimental global toggle
   // so a Settings change enables/disables RPC input mode for new codex-family
-  // sessions without a daemon restart. The daemon ORs this with each bot's own
-  // `codexRpcInput` flag when building the worker init message.
+  // sessions without a daemon restart. A bot's explicit true/false overrides
+  // this default; only an absent bot setting inherits it.
   // Default OFF (absent ⇒ disabled): the hybrid RPC pane lifecycle (resume
   // respawn + ready-gate) must be live-verified before the fleet default flips
   // ON. A per-bot codexRpcInput:true still force-enables; the dashboard toggle
@@ -423,6 +419,14 @@ export const config = {
   // thinking-only nudge as a send failure; it is harmless but unnecessary for the
   // common all-Claude setup, so operators opt in explicitly.
   get noVisibleOutputHint(): boolean { return readGlobalConfig().dashboard?.noVisibleOutputHint === true; },
+  // Live getter (like noVisibleOutputHint): the experimental switch for reaping
+  // tmux SERVERS orphaned by a previous daemon generation (see
+  // core/orphan-tmux-reaper.ts). This performs automatic process kills, so it is
+  // default OFF and an operator enables it explicitly from the Dashboard
+  // experimental settings; read live so a flip applies to the next daemon restart
+  // without a rebuild. BOTMUX_DISABLE_ORPHAN_TMUX_REAP=1 remains an emergency
+  // kill-switch checked inside the reaper itself.
+  get reapOrphanTmuxServers(): boolean { return readGlobalConfig().dashboard?.reapOrphanTmuxServers === true; },
   // Live getter (like noVisibleOutputHint): the experimental cross-principal
   // interruption (XPI) switch. Default OFF (absent ⇒ disabled) — with it off the
   // daemon delivers another principal's message normally instead of diverting it
@@ -439,17 +443,6 @@ export const config = {
   // `!disableCliBypass` before handing it to the adapter (see worker init).
   get bypassCodexHookTrust(): boolean { return readGlobalConfig().dashboard?.bypassCodexHookTrust !== false; },
   get hideCodexRateLimitModelNudge(): boolean { return readGlobalConfig().dashboard?.hideCodexRateLimitModelNudge !== false; },
-  // Live getter: machine-wide switch for the reply-card footer brand signature
-  // (default botmux link / per-bot custom brandLabel). Default ON (absent ⇒
-  // shown); an explicit stored false suppresses the brand segment on EVERY bot's
-  // final/broadcast cards (usage/duration/recipient lines are unaffected). Read
-  // live (readGlobalConfig has a 2s TTL) so a Dashboard Settings flip applies to
-  // the next card render without restarting the daemon. Resolved in
-  // bot-registry.resolveBrandLabel, which is the single choke point all card
-  // builders feed; sandboxed one-shot `botmux send` children receive the value
-  // via the worker's env bridge.
-  get cardBrandLabelEnabled(): boolean { return readGlobalConfig().dashboard?.cardBrandLabel !== false; },
 };
 
-// allowedUsers is mutable — daemon resolves email prefixes to open_ids at startup
 export type Config = typeof config;

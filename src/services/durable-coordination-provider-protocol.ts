@@ -9,8 +9,12 @@ export const DURABLE_COORDINATION_PROVIDER_METHODS = [
   'renewSessionLease',
   'releaseSessionLease',
   'readSession',
+  'listSessions',
   'writeSession',
+  'readAuxiliaryState',
+  'writeAuxiliaryState',
   'enqueueInbox',
+  'enqueueInboxWithLease',
   'claimNextInbox',
   'renewInboxClaim',
   'completeInboxClaim',
@@ -22,6 +26,13 @@ export const DURABLE_COORDINATION_PROVIDER_METHODS = [
   'retryOutboxAttempt',
   'markOutboxAmbiguous',
   'readOutbox',
+  'enqueueControlOperation',
+  'beginControlOperationAttempt',
+  'completeControlOperationAttempt',
+  'retryControlOperationAttempt',
+  'markControlOperationAmbiguous',
+  'reconcileControlOperation',
+  'readControlOperation',
   'close',
 ] as const;
 
@@ -116,6 +127,15 @@ function sessionRecord(value: unknown): boolean {
     && integer(item.updatedAt);
 }
 
+function auxiliaryStateRecord(value: unknown): boolean {
+  const item = record(value);
+  return !!item
+    && nonempty(item.stateKey)
+    && integer(item.revision, 1)
+    && durableJson(item.value)
+    && integer(item.updatedAt);
+}
+
 function inboxEvent(value: unknown): boolean {
   const item = record(value);
   return !!item
@@ -169,6 +189,35 @@ function outboxAttempt(value: unknown): boolean {
   return !!item && outboxReservation(item) && integer(item.attempt, 1);
 }
 
+const CONTROL_OPERATION_STATES = new Set(['pending', 'attempting', 'ambiguous', 'completed']);
+
+function controlOperationRecord(value: unknown): boolean {
+  const item = record(value);
+  return !!item
+    && nonempty(item.operationId)
+    && nonempty(item.sessionKey)
+    && durableJson(item.payload)
+    && integer(item.createdAt)
+    && typeof item.state === 'string'
+    && CONTROL_OPERATION_STATES.has(item.state)
+    && integer(item.originEpoch, 1)
+    && integer(item.attempts)
+    && (item.result === undefined || durableJson(item.result))
+    && (item.reconciliation === undefined || durableJson(item.reconciliation))
+    && (item.lastError === undefined || typeof item.lastError === 'string')
+    && integer(item.updatedAt);
+}
+
+function controlOperationAttempt(value: unknown): boolean {
+  const item = record(value);
+  return !!item
+    && nonempty(item.operationId)
+    && nonempty(item.sessionKey)
+    && nonempty(item.ownerId)
+    && integer(item.leaseEpoch, 1)
+    && integer(item.attempt, 1);
+}
+
 function oneOfKinds(value: unknown, kinds: readonly string[]): Record<string, unknown> | undefined {
   const item = record(value);
   return item && typeof item.kind === 'string' && kinds.includes(item.kind) ? item : undefined;
@@ -199,6 +248,15 @@ export function validateDurableCoordinationProviderResult(
     case 'readSession':
       valid = value === null || sessionRecord(value);
       break;
+    case 'listSessions': {
+      const item = record(value);
+      valid = !!item
+        && Array.isArray(item.records)
+        && item.records.length <= 1_000
+        && item.records.every(sessionRecord)
+        && (item.nextSessionKey === undefined || nonempty(item.nextSessionKey));
+      break;
+    }
     case 'writeSession': {
       const item = oneOfKinds(value, ['written', 'conflict', 'stale_lease']);
       valid = !!item && (item.kind === 'written'
@@ -208,8 +266,24 @@ export function validateDurableCoordinationProviderResult(
           : true);
       break;
     }
+    case 'readAuxiliaryState':
+      valid = value === null || auxiliaryStateRecord(value);
+      break;
+    case 'writeAuxiliaryState': {
+      const item = oneOfKinds(value, ['written', 'conflict', 'stale_lease']);
+      valid = !!item && (item.kind === 'written'
+        ? auxiliaryStateRecord(item.record)
+        : item.kind === 'conflict'
+          ? item.current === undefined || auxiliaryStateRecord(item.current)
+          : true);
+      break;
+    }
     case 'enqueueInbox': {
       valid = !!oneOfKinds(value, ['inserted', 'duplicate', 'conflict']);
+      break;
+    }
+    case 'enqueueInboxWithLease': {
+      valid = !!oneOfKinds(value, ['inserted', 'duplicate', 'conflict', 'stale_lease']);
       break;
     }
     case 'claimNextInbox':
@@ -243,6 +317,33 @@ export function validateDurableCoordinationProviderResult(
     }
     case 'readOutbox':
       valid = value === null || outboxRecord(value);
+      break;
+    case 'enqueueControlOperation':
+      valid = !!oneOfKinds(value, ['inserted', 'duplicate', 'conflict', 'stale_lease']);
+      break;
+    case 'beginControlOperationAttempt': {
+      const item = oneOfKinds(value, ['applied', 'not_found', 'not_pending', 'stale_lease']);
+      valid = !!item && (item.kind === 'applied'
+        ? controlOperationRecord(item.record) && controlOperationAttempt(item.attempt)
+        : item.kind === 'not_pending'
+          ? controlOperationRecord(item.record)
+          : true);
+      break;
+    }
+    case 'completeControlOperationAttempt':
+    case 'retryControlOperationAttempt':
+    case 'markControlOperationAmbiguous': {
+      const item = oneOfKinds(value, ['applied', 'stale']);
+      valid = !!item && (item.kind === 'stale' || controlOperationRecord(item.record));
+      break;
+    }
+    case 'reconcileControlOperation': {
+      const item = oneOfKinds(value, ['applied', 'stale', 'stale_lease']);
+      valid = !!item && (item.kind !== 'applied' || controlOperationRecord(item.record));
+      break;
+    }
+    case 'readControlOperation':
+      valid = value === null || controlOperationRecord(value);
       break;
     case 'close':
       valid = value === null;

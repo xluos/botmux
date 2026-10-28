@@ -27,6 +27,15 @@ import {
   type DurableSessionFacade,
   type DurableSessionFacadeStopResult,
 } from './durable-session-facade.js';
+import {
+  createDurableSessionControlDispatch,
+  type DurableSessionControlDispatchOptions,
+} from './durable-session-control-dispatch.js';
+import {
+  startDurableSessionControlConsumer,
+  type DurableSessionControlConsumer,
+  type DurableSessionControlConsumerStopResult,
+} from './durable-session-control-consumer.js';
 
 export interface DurableLarkPrimaryRuntimeOptions {
   store: DurableCoordinationStore;
@@ -35,6 +44,7 @@ export interface DurableLarkPrimaryRuntimeOptions {
   deliverOutbox: DurableOutboxPumpOptions['deliver'];
   onLeadershipAcquired?: (leadership: DurableLarkIngressLeadership) => void | Promise<void>;
   onLeadershipLost?: (reason: unknown) => void | Promise<void>;
+  onSessionLeaseLost?: (sessionKey: string, error: Error) => void;
   onError?: (error: unknown) => void;
   ingressOwnerId?: string;
   inboxWorkerId?: string;
@@ -46,6 +56,13 @@ export interface DurableLarkPrimaryRuntimeOptions {
   outboxReservationLeaseMs?: number;
   outboxAttemptTimeoutMs?: number;
   shutdownMs?: number;
+  control?: {
+    ownedPartitionKeys(): readonly string[];
+    partitionKeyPrefix?: string;
+    resolve: DurableSessionControlDispatchOptions['resolve'];
+    workerId?: string;
+    intervalMs?: number;
+  };
 }
 
 export interface DurableLarkPrimaryRuntimeStopResult {
@@ -53,6 +70,7 @@ export interface DurableLarkPrimaryRuntimeStopResult {
   ingress: DurableLarkPrimaryIngressStopResult;
   inbox: DurableInboxPrimaryStopResult;
   outbox: DurableOutboxPumpStopResult;
+  control?: DurableSessionControlConsumerStopResult;
   session: DurableSessionFacadeStopResult;
 }
 
@@ -60,6 +78,7 @@ export interface DurableLarkPrimaryRuntime {
   readonly ingress: DurableLarkPrimaryIngress;
   readonly inbox: DurableInboxPrimaryConsumer;
   readonly outbox: DurableOutboxPump;
+  readonly control?: DurableSessionControlConsumer;
   readonly session: DurableSessionFacade;
   ready: Promise<void>;
   status(): DurableLarkPrimaryIngressStatus;
@@ -74,6 +93,16 @@ function boundedInteger(value: number, name: string, minimum: number, maximum: n
   return value;
 }
 
+function primarySessionOwnsLiveRuntime(value: unknown): boolean {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const envelope = value as Record<string, unknown>;
+  if (envelope.type !== 'botmux.session.primary'
+      || !envelope.session
+      || typeof envelope.session !== 'object'
+      || Array.isArray(envelope.session)) return false;
+  return (envelope.session as Record<string, unknown>).status === 'active';
+}
+
 /** Compose the disabled-state primary data plane under one shutdown budget. */
 export function startDurableLarkPrimaryRuntime(
   options: DurableLarkPrimaryRuntimeOptions,
@@ -86,9 +115,19 @@ export function startDurableLarkPrimaryRuntime(
     store: options.store,
     ...(options.sessionOwnerId ? { ownerId: options.sessionOwnerId } : {}),
     shutdownMs,
+    keepLeaseAlive: primarySessionOwnsLiveRuntime,
+    onLeaseLost: (sessionKey, error) => {
+      reportError(new Error(
+        `durable active Session lease lost for ${sessionKey}: ${error.message}`,
+      ));
+      try { options.onSessionLeaseLost?.(sessionKey, error); } catch (callbackError) {
+        reportError(callbackError);
+      }
+    },
   });
   const dispatch = createDurableLarkCanonicalDispatch({
     facade: session,
+    store: options.store,
     handle: options.handleCanonical,
   });
   const inbox = startDurableInboxPrimaryConsumer({
@@ -128,6 +167,26 @@ export function startDurableLarkPrimaryRuntime(
       );
     },
   });
+  const control = options.control
+    ? startDurableSessionControlConsumer({
+        store: options.store,
+        ownedPartitionKeys: options.control.ownedPartitionKeys,
+        ...(options.control.partitionKeyPrefix
+          ? { partitionKeyPrefix: options.control.partitionKeyPrefix }
+          : {}),
+        dispatch: createDurableSessionControlDispatch({
+          store: options.store,
+          sessionOwnerId: session.ownerId,
+          resolve: options.control.resolve,
+        }),
+        ...(options.control.workerId ? { workerId: options.control.workerId } : {}),
+        ...(options.control.intervalMs === undefined
+          ? {}
+          : { intervalMs: options.control.intervalMs }),
+        shutdownMs,
+        onError: reportError,
+      })
+    : undefined;
   const ingress = startDurableLarkPrimaryIngress({
     store: options.store,
     larkAppId: options.larkAppId,
@@ -141,13 +200,19 @@ export function startDurableLarkPrimaryRuntime(
     onError: reportError,
   });
   let stopPromise: Promise<DurableLarkPrimaryRuntimeStopResult> | undefined;
-  const ready = Promise.all([inbox.ready, outbox.ready, ingress.ready]).then(() => undefined);
+  const ready = Promise.all([
+    inbox.ready,
+    outbox.ready,
+    ...(control ? [control.ready] : []),
+    ingress.ready,
+  ]).then(() => undefined);
   const remaining = (deadline: number): number => Math.max(0, deadline - Date.now());
 
   return {
     ingress,
     inbox,
     outbox,
+    ...(control ? { control } : {}),
     session,
     ready,
     status: () => ingress.status(),
@@ -158,17 +223,20 @@ export function startDurableLarkPrimaryRuntime(
       stopPromise = (async () => {
         const ingressResult = await ingress.stop(remaining(deadline));
         const inboxResult = await inbox.stop(remaining(deadline));
+        const controlResult = control ? await control.stop(remaining(deadline)) : undefined;
         const outboxResult = await outbox.stop(remaining(deadline));
         const sessionResult = await session.stop(remaining(deadline));
         return {
           kind: ingressResult.kind === 'stopped'
             && inboxResult.kind === 'stopped'
+            && (!controlResult || controlResult.kind === 'stopped')
             && outboxResult.kind === 'stopped'
             && sessionResult.kind === 'stopped'
             ? 'stopped'
             : 'timed_out',
           ingress: ingressResult,
           inbox: inboxResult,
+          ...(controlResult ? { control: controlResult } : {}),
           outbox: outboxResult,
           session: sessionResult,
         };
@@ -178,6 +246,7 @@ export function startDurableLarkPrimaryRuntime(
     terminate: () => {
       ingress.terminate();
       inbox.terminate();
+      control?.terminate();
       outbox.terminate();
       session.terminate();
     },

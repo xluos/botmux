@@ -35,6 +35,7 @@ import {
   isCodexNotifierHookInstalled,
 } from '../features/codex-notifier/index.js';
 import { isLocale } from '../i18n/types.js';
+import { normalizePromptCacheConfig, type PromptCacheConfig } from '../services/prompt-cache-policy.js';
 import { isLocalDevInstall } from '../utils/install-info.js';
 import { isAutoUpdateSupportedInstall } from '../utils/global-install.js';
 import { isValidTimeZone } from '../utils/timezone.js';
@@ -55,6 +56,7 @@ export interface ResolvedDashboardSettingsView {
   herdrTraexPlugin: { enabled: boolean; source: string; ref: string; recommendedSource: string; recommendedRef: string };
   codexRpcInput: boolean;
   autoUpgradeCodexSessions: boolean;
+  reapOrphanTmuxServers: boolean;
   bypassCodexHookTrust: boolean;
   hideCodexRateLimitModelNudge: boolean;
   /** Machine-wide reply-card footer brand signature switch. Default ON. */
@@ -112,9 +114,13 @@ export interface ResolvedDashboardSettingsView {
   remoteAccess?: boolean;
   /** Machine-wide v3 Workflow feature switch. Default ON. */
   workflow: { enabled: boolean };
+  /** Machine-wide Claude Code prompt-cache default (TTL + idle keep-alive);
+   *  null = not configured (off). Bots override it field by field. */
+  promptCache: PromptCacheConfig | null;
   /** 定时自动清理空闲会话。默认关闭。olderThanHours/intervalMinutes 反映当前
    *  生效值（含默认回退），供设置页回显。 */
   sessionCleanup: {
+    archiveCodex?: boolean;
     enabled: boolean;
     olderThanHours: SessionCleanupHours;
     intervalMinutes: number;
@@ -123,6 +129,8 @@ export interface ResolvedDashboardSettingsView {
   multiTopic: { enabled: boolean };
   /** OAuth 授权回跳基址（`<base>/oauth/callback`），null/absent = 未配置。 */
   oauthRedirectBase?: string | null;
+  /** Proxy for binary self-update downloads, null/absent = unset. */
+  httpProxy?: string | null;
   /** Configured schedule-task timezone override (IANA), or null/absent when
    *  unset ⇒ the scheduler follows `hostTimeZone`. */
   scheduleTimeZone?: string | null;
@@ -139,6 +147,8 @@ export type ParseMaintenanceResult =
 
 /** All IO this helper needs — injected so tests use mocks, production wires real impls. */
 export interface SettingsWriteApplierDeps {
+  /** Optional outer transaction used by durable multi-replica deployments. */
+  runConfigMutation?: <T>(mutation: () => Promise<T>) => Promise<T>;
   /** Snapshot of `~/.botmux/config.json`. Used to look up the persisted autoUpdate state when the incoming patch doesn't change it. */
   readGlobalConfig: () => GlobalConfig;
   /** Atomic write of dashboard-level fields. */
@@ -237,6 +247,7 @@ export type ApplySettingsWriteError =
   | 'invalid_herdrTraexPlugin_ref'
   | 'invalid_codexRpcInput'
   | 'invalid_autoUpgradeCodexSessions'
+  | 'invalid_reapOrphanTmuxServers'
   | 'invalid_bypassCodexHookTrust'
   | 'invalid_hideCodexRateLimitModelNudge'
   | 'invalid_cardBrandLabel'
@@ -269,12 +280,15 @@ export type ApplySettingsWriteError =
   | 'invalid_vcMeetingAgent_listenerBotAppId'
   | 'invalid_workflow'
   | 'invalid_workflow_enabled'
+  | 'invalid_promptCache'
   | 'invalid_sessionCleanup'
   | 'invalid_sessionCleanup_enabled'
+  | 'invalid_sessionCleanup_archiveCodex'
   | 'invalid_sessionCleanup_olderThanHours'
   | 'invalid_sessionCleanup_intervalMinutes'
   | 'invalid_scheduleTimeZone'
   | 'invalid_oauthRedirectBase'
+  | 'invalid_httpProxy'
   | 'invalid_whiteboard'
   | 'invalid_whiteboard_enabled'
   | 'invalid_lang'
@@ -374,6 +388,10 @@ export async function applySettingsWrite(
   body: unknown,
   deps: SettingsWriteApplierDeps,
 ): Promise<ApplySettingsWriteResult> {
+  if (deps.runConfigMutation) {
+    const { runConfigMutation, ...innerDeps } = deps;
+    return runConfigMutation(() => applySettingsWrite(body, innerDeps));
+  }
   const obj = body && typeof body === 'object' && !Array.isArray(body)
     ? body as Record<string, unknown>
     : {};
@@ -467,6 +485,12 @@ export async function applySettingsWrite(
       return { ok: false, error: 'invalid_autoUpgradeCodexSessions' };
     }
     patch.autoUpgradeCodexSessions = obj.autoUpgradeCodexSessions;
+  }
+  if ('reapOrphanTmuxServers' in obj) {
+    if (typeof obj.reapOrphanTmuxServers !== 'boolean') {
+      return { ok: false, error: 'invalid_reapOrphanTmuxServers' };
+    }
+    patch.reapOrphanTmuxServers = obj.reapOrphanTmuxServers;
   }
   if ('bypassCodexHookTrust' in obj) {
     if (typeof obj.bypassCodexHookTrust !== 'boolean') {
@@ -662,6 +686,10 @@ export async function applySettingsWrite(
     // Merge over the validated existing block so a partial patch (e.g. just the
     // toggle) keeps the other supported fields.
     const next: SessionCleanupGlobalConfig = { ...(deps.readGlobalConfig().sessionCleanup ?? {}) };
+    if ('archiveCodex' in sc) {
+      if (typeof sc.archiveCodex !== 'boolean') return { ok: false, error: 'invalid_sessionCleanup_archiveCodex' };
+      next.archiveCodex = sc.archiveCodex;
+    }
     if ('enabled' in sc) {
       if (typeof sc.enabled !== 'boolean') {
         return { ok: false, error: 'invalid_sessionCleanup_enabled' };
@@ -687,10 +715,22 @@ export async function applySettingsWrite(
       }
       next.intervalMinutes = Math.floor(sc.intervalMinutes);
     }
-    if (!('enabled' in sc) && !('olderThanHours' in sc) && !('intervalMinutes' in sc)) {
+    if (!('archiveCodex' in sc) && !('enabled' in sc) && !('olderThanHours' in sc) && !('intervalMinutes' in sc)) {
       return { ok: false, error: 'invalid_sessionCleanup' };
     }
     deps.mergeGlobalConfig({ sessionCleanup: next });
+    touched = true;
+  }
+
+  if ('promptCache' in obj) {
+    // Whole-block replacement (the Settings form always sends every field it
+    // shows); null clears the machine-wide default. Same strict normalizer as
+    // the per-bot layer, so both doors reject the same typos.
+    let next: PromptCacheConfig | undefined;
+    try { next = normalizePromptCacheConfig(obj.promptCache); } catch {
+      return { ok: false, error: 'invalid_promptCache' };
+    }
+    deps.mergeGlobalConfig({ promptCache: next ?? null });
     touched = true;
   }
 
@@ -761,6 +801,22 @@ export async function applySettingsWrite(
       touched = true;
     } else {
       return { ok: false, error: 'invalid_oauthRedirectBase' };
+    }
+  }
+
+  if ('httpProxy' in obj) {
+    const v = obj.httpProxy;
+    if (v === null || (typeof v === 'string' && v.trim() === '')) {
+      // 清除 → release-download 退回 HTTPS_PROXY / HTTP_PROXY 环境变量。
+      deps.mergeGlobalConfig({ httpProxy: null });
+      touched = true;
+    } else if (typeof v === 'string') {
+      const normalized = normalizeHttpProxy(v);
+      if (!normalized) return { ok: false, error: 'invalid_httpProxy' };
+      deps.mergeGlobalConfig({ httpProxy: normalized });
+      touched = true;
+    } else {
+      return { ok: false, error: 'invalid_httpProxy' };
     }
   }
 
@@ -844,4 +900,18 @@ export async function applySettingsWrite(
 
   if (!touched) return { ok: false, error: 'empty_patch' };
   return { ok: true, settings: deps.resolveDashboardSettings() };
+}
+
+/** `http://[user:pass@]host[:port]` with no path / query — what
+ *  release-download's CONNECT tunnel accepts. It always dials the proxy over
+ *  plain HTTP (then TLS to GitHub inside the tunnel), so an `https://` proxy
+ *  URL would only fail later with an opaque socket error; reject it here.
+ *  Returns the trimmed value without a trailing slash, or null. */
+export function normalizeHttpProxy(raw: string): string | null {
+  const trimmed = raw.trim().replace(/\/+$/, '');
+  let url: URL;
+  try { url = new URL(trimmed); } catch { return null; }
+  if (url.protocol !== 'http:') return null;
+  if (!url.hostname || url.pathname !== '/' || url.search || url.hash) return null;
+  return trimmed;
 }

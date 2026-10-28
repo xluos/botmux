@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawnSyncTsScript } from './helpers/ts-runner.js';
+import { classifyRemoteRunnerOutboundHostResult } from '../src/services/remote-runner-outbound-send.js';
 
 const cli = fileURLToPath(new URL('../src/cli.ts', import.meta.url));
 
@@ -51,6 +52,15 @@ describe('send --dry-run', () => {
     expect(JSON.parse(result.stdout).card.body.elements[0]).toMatchObject({ tag: 'markdown', content: '**加粗**' });
   });
 
+  it('previews positional paragraph escapes the same way as a real send', () => {
+    const result = run(['send', '--dry-run', '第一段\\n\\n第二段']);
+    expect(result.status).toBe(0);
+    expect(JSON.parse(result.stdout).card.body.elements[0]).toMatchObject({
+      tag: 'markdown',
+      content: '第一段\n\n第二段',
+    });
+  });
+
   it('reports degraded charts on stderr and in the JSON', () => {
     const body = '```vega-lite\n{"title":"远程","data":{"url":"http://evil.example"},"mark":"bar"}\n```';
     const result = run(['send', '--dry-run', '--content-file', '@body'], body);
@@ -80,4 +90,24 @@ describe('send --dry-run', () => {
     expect(result.stdout).toContain('--dry-run');
     expect(result.stdout).toContain('```vega-lite');
   });
+});
+
+describe('send --remote-runner-outbound mention guard', () => {
+  it.each(['--help', ' --help', '-h', '--dry-run'])(
+    'rejects a flag-shaped Remote Runner mention value %s before early exits',
+    flag => {
+      const result = run([
+        'send', '--remote-runner-outbound', '--response-kind', 'progress',
+        '--mention', flag, 'must not send',
+      ]);
+      expect(result.status).toBe(2);
+      expect(result.stdout).toBe('');
+      expect(result.stderr).toContain('mention values must not look like CLI flags');
+      expect(classifyRemoteRunnerOutboundHostResult(
+        result.status,
+        result.stdout,
+        result.stderr,
+      )).toMatchObject({ outcome: 'rejected', code: 'outbound_rejected' });
+    },
+  );
 });

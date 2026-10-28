@@ -25,10 +25,10 @@ import {
   createReplyCard,
   DEFAULT_BRAND_LABEL,
   extractFirstReplyCardHeading,
-  hasMarkdown,
   normalizeLocalHomeLinks,
   REPLY_CARD_FOOTER_MARKER,
 } from '../src/im/lark/md-card.js';
+import type { CardUsageSnapshot } from '../src/im/lark/md-card.js';
 
 function mdElements(out: any[]): Array<{ tag: 'markdown'; content: string }> {
   return out.filter(e => e.tag === 'markdown');
@@ -197,6 +197,102 @@ describe('buildCardBodyElements', () => {
     // And must have a blank line before the opening fence and after the closing fence.
     expect(content).toMatch(/是同步返回：\n\n```ts/);
     expect(content).toMatch(/```\n\nnext prose/);
+  });
+
+  it('lifts a code fence out of an ordered list into its own card element', () => {
+    const input = [
+      '1. Read the value.',
+      '2. When it is missing, run:',
+      '   ```cpp',
+      '   values.assign(128, 0.f);',
+      '   return true;',
+      '   ```',
+      '3. Continue processing.',
+    ].join('\n');
+    expect(buildCardBodyElements(input)).toEqual([
+      { tag: 'markdown', content: '1. Read the value.\n2. When it is missing, run:' },
+      { tag: 'markdown', content: '```cpp\nvalues.assign(128, 0.f);\nreturn true;\n```' },
+      { tag: 'markdown', content: '3. Continue processing.' },
+    ]);
+  });
+
+  it.each([
+    ['- Run:', '  ', '- Done.'],
+    ['- Outer\n  - Run:', '    ', '  - Done.'],
+    ['> Run:', '> ', '> Done.'],
+    ['> - Run:', '>   ', '> - Done.'],
+  ])('lifts nested fences after %s without treating code as prose', (before, prefix, after) => {
+    const code = ['if (ready) {', '  execute();', '', '', '', '}', '![literal](https://example.com/image.png)', '', ''];
+    const input = [before, prefix + '````text', ...code.map(line => prefix + line), prefix + '````', after].join('\n');
+    const elements = buildCardBodyElements(input);
+    expect(elements).toHaveLength(3);
+    expect(elements[1]).toEqual({ tag: 'markdown', content: '````text\n' + code.join('\n') + '\n````' });
+    expect(elements[0].content).toContain('Run:');
+    expect(elements[2].content).toContain('Done.');
+  });
+
+  it('keeps multiple code blocks and intervening list-item prose in order', () => {
+    const input = [
+      '- Start', '  ```js', '  first();', '  ```',
+      '', '  Continue', '',
+      '  ~~~js', '  second();', '  ~~~', '- Done',
+    ].join('\n');
+    expect(buildCardBodyElements(input)).toEqual([
+      { tag: 'markdown', content: '- Start' },
+      { tag: 'markdown', content: '```js\nfirst();\n```' },
+      { tag: 'markdown', content: 'Continue' },
+      { tag: 'markdown', content: '~~~js\nsecond();\n~~~' },
+      { tag: 'markdown', content: '- Done' },
+    ]);
+  });
+
+  it('lifts indented code in a list without closing on literal backticks', () => {
+    const input = ['- Example:', '', '      ```', '      literal', '      ```', '', '- Done'].join('\n');
+    expect(buildCardBodyElements(input)[1]).toEqual({
+      tag: 'markdown', content: '````\n```\nliteral\n```\n````',
+    });
+  });
+
+  it('does not turn deeply indented continuation paragraphs into code after a lifted fence', () => {
+    const input = [
+      '- Outer', '  - Start', '    ```js', '    first();', '    ```',
+      '', '    Continue', '', '    Another paragraph', '', '- Done',
+    ].join('\n');
+    expect(buildCardBodyElements(input)).toEqual([
+      { tag: 'markdown', content: '- Outer\n  - Start' },
+      { tag: 'markdown', content: '```js\nfirst();\n```' },
+      { tag: 'markdown', content: 'Continue\n\nAnother paragraph\n\n- Done' },
+    ]);
+  });
+
+  it('keeps code-only list items and empty code fences', () => {
+    expect(buildCardBodyElements('- ```js\n  run();\n  ```\n- ```\n  ```')).toEqual([
+      { tag: 'markdown', content: '```js\nrun();\n```' },
+      { tag: 'markdown', content: '```\n```' },
+    ]);
+  });
+
+  it('keeps other blocks between lifted code and continuation paragraphs', () => {
+    const input = '- Start\n  ```js\n  run();\n  ```\n\n  ### Details\n\n  First paragraph\n\n  Second paragraph';
+    const elements = buildCardBodyElements(input);
+    expect(elements[2].content).toBe('### Details\n\nFirst paragraph\n\nSecond paragraph');
+  });
+
+  it('keeps source indentation of multi-paragraph list items when no code is lifted', () => {
+    // The startLine > map[0] guard must keep the generic source-slice path
+    // for paragraphs before any lifted code: stripping their indentation here
+    // would make CommonMark render the later paragraphs outside the list item.
+    const input = '- a\n\n  p1\n\n  p2';
+    expect(buildCardBodyElements(input)).toEqual([
+      { tag: 'markdown', content: '- a\n\n  p1\n\n  p2' },
+    ]);
+  });
+
+  it('keeps source markers of multi-paragraph quotes when no code is lifted', () => {
+    const input = '> q\n>\n> p1\n>\n> p2';
+    expect(buildCardBodyElements(input)).toEqual([
+      { tag: 'markdown', content: '> q\n>\n> p1\n>\n> p2' },
+    ]);
   });
 
   it('Bug B: 3-backtick nested fences don\'t corrupt later prose', () => {
@@ -918,6 +1014,43 @@ describe('buildMarkdownCard', () => {
     expect(seg).not.toContain('上下文');
   });
 
+  it('streaming variant appends the session cache hit rate after 累计', () => {
+    // Claude: in = input + cache_read + cache_create (cache-inclusive).
+    const usage = { context: null, tokens: { in: 1_000_000, out: 7_800, cacheReadTokens: 873_000, cacheCreateTokens: 120_000 } };
+    expect(cardUsageFooterSegment(usage, 'zh', 'streaming')).toBe('累计 ↑1M ↓7.8K · 缓存命中 87%');
+    expect(cardUsageFooterSegment(usage, 'en', 'streaming')).toBe('Total ↑1M ↓7.8K · Cache hit 87%');
+    // Footer variant stays context-only.
+    expect(cardUsageFooterSegment(usage, 'zh', 'footer')).toBeNull();
+  });
+
+  it('cache hit rate floors, shows 0% for write-only caches and hides without cache activity', () => {
+    const seg = (tokens: NonNullable<CardUsageSnapshot['tokens']>) =>
+      cardUsageFooterSegment({ context: null, tokens }, 'zh', 'streaming');
+    // Floor, so a nearly-full cache never reads as 100%.
+    expect(seg({ in: 1000, out: 10, cacheReadTokens: 996, cacheCreateTokens: 4 })).toBe('累计 ↑1K ↓10 · 缓存命中 99%');
+    expect(seg({ in: 1000, out: 10, cacheReadTokens: 1000 })).toBe('累计 ↑1K ↓10 · 缓存命中 100%');
+    // Cache written but never read is an honest 0%.
+    expect(seg({ in: 50_000, out: 100, cacheReadTokens: 0, cacheCreateTokens: 40_000 })).toBe('累计 ↑50K ↓100 · 缓存命中 0%');
+    // Codex reports cached reads only (no cache_creation field).
+    expect(seg({ in: 200_000, out: 900, cacheReadTokens: 150_000 })).toBe('累计 ↑200K ↓900 · 缓存命中 75%');
+    // A dialect with no cache fields folds to 0/0 — unknown, not 0%.
+    expect(seg({ in: 50_000, out: 100, cacheReadTokens: 0, cacheCreateTokens: 0 })).toBe('累计 ↑50K ↓100');
+    expect(seg({ in: 50_000, out: 100 })).toBe('累计 ↑50K ↓100');
+    // A remote provider reporting cacheCreate alone (no read field) still shows
+    // an honest 0% rather than hiding cache activity.
+    expect(seg({ in: 50_000, out: 100, cacheCreateTokens: 40_000 })).toBe('累计 ↑50K ↓100 · 缓存命中 0%');
+  });
+
+  it('cache hit rate keeps exact integer percentages under floating point', () => {
+    const seg = (tokens: NonNullable<CardUsageSnapshot['tokens']>) =>
+      cardUsageFooterSegment({ context: null, tokens }, 'zh', 'streaming');
+    // (read / in) * 100 lands on x.99999… for these exact integer ratios;
+    // multiplying first must keep them at 29% / 57% / 58%.
+    expect(seg({ in: 1_000_000, out: 100, cacheReadTokens: 290_000 })).toBe('累计 ↑1M ↓100 · 缓存命中 29%');
+    expect(seg({ in: 1_000_000, out: 100, cacheReadTokens: 570_000 })).toBe('累计 ↑1M ↓100 · 缓存命中 57%');
+    expect(seg({ in: 1_000_000, out: 100, cacheReadTokens: 580_000 })).toBe('累计 ↑1M ↓100 · 缓存命中 58%');
+  });
+
   it('keeps the metric formatter runtime-free so the streaming renderer owns the tail', () => {
     const seg = cardUsageFooterSegment(
       {
@@ -936,29 +1069,37 @@ describe('buildMarkdownCard', () => {
   it('cardUsageRuntimeSegment renders a compact model (bold) + effort tail', () => {
     expect(cardUsageRuntimeSegment(
       { context: null, tokens: null, model: 'GPT-5.6-Sol', reasoningEffort: 'xhigh' },
-      true,
     )).toBe('**GPT-5.6-Sol** xhigh');
     // no effort -> model only, no trailing space/placeholder
     expect(cardUsageRuntimeSegment(
       { context: null, tokens: null, model: 'gpt-4o' },
-      true,
     )).toBe('**gpt-4o**');
     // no model -> nothing
     expect(cardUsageRuntimeSegment(
       { context: null, tokens: null, reasoningEffort: 'xhigh' },
-      true,
     )).toBeNull();
-    // no metric line to anchor to -> nothing (matches footer contract)
-    expect(cardUsageRuntimeSegment(
-      { context: null, tokens: null, model: 'GPT-5.6-Sol', reasoningEffort: 'xhigh' },
-      false,
-    )).toBeNull();
+  });
+
+  it('preserves Cursor effort and fast variants encoded in the selected model ID', () => {
+    for (const model of ['claude-opus-5-5-high', 'claude-opus-5-5-high-fast']) {
+      expect(cardUsageRuntimeSegment({ context: null, tokens: null, model })).toBe(`**${model}**`);
+    }
+  });
+
+  it('includes known model/effort in a signed final footer without token metrics', () => {
+    const card = JSON.parse(buildCanonicalFinalReplyCard({
+      markdown: 'Answer', brand: '',
+      usage: { context: null, tokens: null, model: 'gpt-5.6-sol', reasoningEffort: 'high' },
+    }));
+    const footer = card.body.elements.find((e: any) => e.element_id === 'botmux_reply_footer');
+    expect(footer.content).toContain('**gpt-5.6-sol** high');
+    expect(footer.content).toContain(REPLY_CARD_FOOTER_MARKER);
+    expect(footer.content).not.toMatch(/Context|上下文|↑|↓/);
   });
 
   it('renders a backend variant between the model and reasoning effort', () => {
     expect(cardUsageRuntimeSegment(
       { context: null, tokens: null, model: 'GPT-5.6-Terra', modelBackendVariant: 'max', reasoningEffort: 'xhigh' },
-      true,
     )).toBe('**GPT-5.6-Terra** Max · xhigh');
   });
 
@@ -967,21 +1108,18 @@ describe('buildMarkdownCard', () => {
     // underscores are markdown-escaped by the shared compact formatter.
     expect(cardUsageRuntimeSegment(
       { context: null, tokens: null, model: 'model_hub/es1_orange_o48' },
-      true,
     )).toBe('**es1\\_orange\\_o48**');
     // a value with no slash is untouched
     expect(cardUsageRuntimeSegment(
       { context: null, tokens: null, model: 'gpt-5.6-sol' },
-      true,
     )).toBe('**gpt-5.6-sol**');
     // only a clean single-token prefix + one slash is removed
     expect(cardUsageRuntimeSegment(
       { context: null, tokens: null, model: 'a/b/c' },
-      true,
     )).toBe('**b/c**');
   });
 
-  it('does not create a standalone runtime line without native usage metrics', () => {
+  it('keeps the metric formatter empty when only runtime identity is known', () => {
     expect(cardUsageFooterSegment(
       {
         context: null,
@@ -1002,7 +1140,6 @@ describe('buildMarkdownCard', () => {
         model: `[very-long-${'x'.repeat(60)}] <at id=ou_fake></at>`,
         reasoningEffort: '*xhigh*',
       },
-      true,
     )!;
     expect(seg).toContain('**\\[very-long-');
     expect(seg).toContain('…** \\*xhigh\\*');
@@ -1271,15 +1408,6 @@ describe('buildReplyCardFooter', () => {
     );
     expect(footer?.content).not.toContain('github.com/deepcoldy/bot%6Dux');
   });
-});
-
-describe('hasMarkdown', () => {
-  it('detects fences', () => expect(hasMarkdown('a\n```\nx\n```')).toBe(true));
-  it('detects headings', () => expect(hasMarkdown('# title')).toBe(true));
-  it('detects bold', () => expect(hasMarkdown('hello **world**')).toBe(true));
-  it('detects pipe tables', () => expect(hasMarkdown('| a | b |\n| - | - |')).toBe(true));
-  it('returns false for plain text', () => expect(hasMarkdown('just words here')).toBe(false));
-  it('returns false for empty', () => expect(hasMarkdown('')).toBe(false));
 });
 
 // ─── Footer brand label (per-bot configurable) ────────────────────────────

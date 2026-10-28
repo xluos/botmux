@@ -435,6 +435,16 @@ function linuxBaseline(h: string): FsRule[] {
   ];
 }
 
+/** Host credential trees the baseline preset DENIES for `homeDir` (crown jewels:
+ *  ~/.ssh, ~/.aws, ~/.netrc, toolchain tokens, ~/.lark-cli, macOS keychains …).
+ *  Exported so daemon-side code that COPIES host content into a sandbox-readable
+ *  place (session skill snapshots, core/skills/snapshot.ts) refuses the very same
+ *  trees — one source of truth for "what is a host secret". Pure. */
+export function baselineDeniedHostPaths(platform: 'darwin' | 'linux', homeDir: string): string[] {
+  const base = platform === 'darwin' ? darwinBaseline(homeDir) : linuxBaseline(homeDir);
+  return base.filter(rule => rule.access === 'deny').map(rule => rule.path);
+}
+
 // ───────────────────────────── policy assembly ───────────────────────────────
 
 /**
@@ -635,7 +645,10 @@ export function computeNoTransportAuthorityRoots(input: {
  */
 export function buildFsPolicy(ctx: FsPolicyContext): FsPolicy {
   const candidates: FsRule[] = [];
-  const hostOnlyRoots = (ctx.hostOnlyDenyPaths ?? [])
+  const hostOnlyRoots = [
+    `${ctx.sessionDataDir}/link-refs`,
+    ...(ctx.hostOnlyDenyPaths ?? []),
+  ]
     .map(normalizeFsPath)
     .filter((p): p is string => p !== null);
   const suppressedHostOnlyPaths: string[] = [];
@@ -853,20 +866,22 @@ export function buildFsPolicy(ctx: FsPolicyContext): FsPolicy {
   // daemon 在每次提交 user turn 前把 reminder/whiteboard 写到这里；hook 子进程
   // （在沙盒内）按内容指纹读回。worker 预创建目录以通过 existence-filter。
   if (ctx.sessionId) push([`${ctx.sessionDataDir}/prompt-ctx/${ctx.sessionId}`], 'readOnly', 'internal');
-  // Trigger-user CLI identity (this session ONLY) — the wrapper on PATH sources
-  // `cli-identity/<sessionId>.bin/.data/<tool>.env` on every invocation. Bind
-  // the per-session directory, not each mutable file: atomic writes replace
-  // inodes, while a long-lived bwrap single-file bind keeps reading the old one.
+  // Trigger-user CLI identity surface (this session ONLY).
   //
-  // Granted per file/dir, never the `cli-identity/` parent: that directory holds
-  // every concurrent session's files, each with a live user token belonging to a
-  // different person. A parent grant would let one session read another's — the
-  // exact cross-person leak this feature exists to prevent — and it would fail
-  // OPEN for sessions created after spawn.
+  // In the proven model the daemon keeps token material in its own memory and
+  // hands it to the wrapper over the loopback process-proof channel, so this
+  // directory holds no tokens at all — only the wrapper binaries, shell shims
+  // and the active-turn marker. In the single-snapshot model it additionally
+  // holds the one per-tool `<tool>.env` file the daemon overwrites each turn.
   //
-  // Read-only by construction: the daemon writes these, the CLI must never be
-  // able to. Writable would let an agent publish its own identity and act as
-  // anyone whose token it could name.
+  // Granted per session directory, never the `cli-identity/` parent: that
+  // directory holds every concurrent session's identity surface. A parent
+  // grant would let one session read another's — the exact cross-person leak
+  // this feature exists to prevent — and it would fail OPEN for sessions
+  // created after spawn.
+  //
+  // Read-only by construction: the daemon writes here, the CLI must never be
+  // able to. Writable would let an agent publish its own identity.
   if (ctx.sessionId && larkTransport) {
     push([`${ctx.sessionDataDir}/cli-identity/${ctx.sessionId}.bin`], 'readOnly', 'internal');
   }
@@ -920,6 +935,8 @@ export function buildFsPolicy(ctx: FsPolicyContext): FsPolicy {
   // 单文件 bind 有效；worker 预创建文件与父目录（bwrap 不能 bind 不存在的源）。共享根与
   // 兄弟会话保持 deny-by-default —— 这份轨迹含会话标识与派发结果，不该跨会话可读可写。
   if (ctx.sessionId) push([`${sd}/ready-signal/${ctx.sessionId}.log`], 'readWrite', 'internal');
+  // Cursor stop hook appends only its own usage journal (no sibling writes).
+  if (ctx.sessionId) push([`${sd}/cursor-usage/${ctx.sessionId}.jsonl`], 'readWrite', 'internal');
   // statusline: `botmux statusline` (Claude's statusLine.command, run INSIDE the
   // sandbox) atomically writes `statusline/<sessionId>/latest.json`. Atomic
   // write = tmp + rename in the parent dir, so a single-file grant (as for
@@ -1044,6 +1061,7 @@ export function buildFsPolicy(ctx: FsPolicyContext): FsPolicy {
       `${ctx.sessionDataDir}/bin`,
     ], 'readOnly', 'internal');
     if (ctx.sessionId) push([`${ctx.sessionDataDir}/turn-sends/${ctx.sessionId}.jsonl`], 'readWrite', 'internal');
+    if (ctx.sessionId) push([`${ctx.sessionDataDir}/cursor-usage/${ctx.sessionId}.jsonl`], 'readWrite', 'internal');
     // statusline snapshot dir (see the larkTransport branch for why a dir, not a file).
     if (ctx.sessionId) push([`${ctx.sessionDataDir}/statusline/${ctx.sessionId}`], 'readWrite', 'internal');
     // Own turn-send-ledger session dir (see the larkTransport branch).

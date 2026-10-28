@@ -11,6 +11,29 @@ export interface DashboardRoute {
   load(): DashboardRouteLoadResult;
 }
 
+/** 当前 hash 路由上的查询参数（`#/page?key=value`）；无参数或非浏览器环境返回 null。 */
+export function hashQueryParam(name: string, hash = typeof location === 'undefined' ? '' : location.hash): string | null {
+  const queryIndex = hash.indexOf('?');
+  if (queryIndex < 0) return null;
+  return new URLSearchParams(hash.slice(queryIndex + 1)).get(name) || null;
+}
+
+/**
+ * 去掉当前 hash 上的某个查询参数：一次性深链（打开抽屉 / 滚到区块）消费完就清掉，
+ * 免得刷新页面又触发一次。走 replaceState，不产生 hashchange，也就不会重挂载页面。
+ */
+export function clearHashQueryParam(name: string): void {
+  if (typeof location === 'undefined' || typeof history === 'undefined') return;
+  const hash = location.hash;
+  const queryIndex = hash.indexOf('?');
+  if (queryIndex < 0) return;
+  const params = new URLSearchParams(hash.slice(queryIndex + 1));
+  if (!params.has(name)) return;
+  params.delete(name);
+  const query = params.toString();
+  history.replaceState(history.state, '', `${location.pathname}${location.search}${hash.slice(0, queryIndex)}${query ? `?${query}` : ''}`);
+}
+
 function pageRoute<T extends Record<K, DashboardRouteRenderer>, K extends keyof T & string>(
   id: string,
   routePrefix: string,
@@ -55,6 +78,8 @@ export const dashboardRoutes: DashboardRoute[] = [
   pageRoute('groups', '#/groups', () => import('./groups-page.js'), 'renderGroupsPage'),
   pageRoute('settings', '#/settings', () => import('./settings-page.js'), 'renderSettingsPage'),
   pageRoute('bot-defaults', '#/bot-defaults', () => import('./bot-defaults-page.js'), 'renderBotDefaultsPage'),
+  // `#/agents`（复数）：`#/agent` 会被 startsWith 匹配吞掉 `#/agent-workbench`。
+  pageRoute('agents', '#/agents', () => import('./agents-page.js'), 'renderAgentsPage'),
   pageRoute('skills', '#/skills', () => import('./skills-page.js'), 'renderSkillsPage'),
   pageRoute('customization', '#/customization', () => import('./customization-page.js'), 'renderCustomizationPage'),
   pageRoute('message-listeners', '#/message-listeners', () => import('./message-listeners-page.js'), 'renderMessageListenersPage'),
@@ -67,13 +92,15 @@ export const dashboardRoutes: DashboardRoute[] = [
   pageRoute('roles', '#/roles', () => import('./roles-page.js'), 'renderRolesPage'),
   pageRoute('schedules', '#/schedules', () => import('./schedules-page.js'), 'renderSchedulesPage'),
   pageRoute('whiteboards', '#/whiteboards', () => import('./whiteboards-page.js'), 'renderWhiteboardsPage'),
+  // 决策看板：`#/board`（汇总）、`#/board/<app>`、`#/board/<app>/<seq>`（详情）。没有别的路由以 `#/board` 开头。
+  pageRoute('decision-board', '#/board', () => import('./decision-board-page.js'), 'renderDecisionBoardPage'),
   pageRoute('doc-watches', '#/doc-watches', () => import('./doc-watches-page.js'), 'renderDocWatchesPage'),
   pageRoute('monitoring', '#/monitoring', () => import('./monitoring-page.js'), 'renderMonitoringPage'),
   pageRoute('sessions', '#/sessions', () => import('./sessions-page.js'), 'renderSessionsPage'),
   pageRoute('monitor-room', '#/monitor-room', () => import('./monitor-room.js'), 'renderMonitorRoomPage', true),
-  pageRoute('office', '#/office', () => import('./office-page.js'), 'renderOfficePage'),
   pageRoute('insights', '#/insights', () => import('./insights-page.js'), 'renderInsightsPage'),
   pageRoute('feedback', '#/feedback', () => import('./feedback-page.js'), 'renderFeedbackPage'),
+  pageRoute('terminal', '#/terminal', () => import('./terminal-page.js'), 'renderTerminalPage'),
 ];
 
 export function findDashboardRoute(hash: string): DashboardRoute | undefined {

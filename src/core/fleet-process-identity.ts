@@ -1,6 +1,7 @@
 import { execFileSync } from 'node:child_process';
 import { existsSync, readFileSync, readlinkSync } from 'node:fs';
 import { readDurableProcessIdentity } from '../utils/process-identity.js';
+import { pidNotProvablyGone } from '../utils/process-alive.js';
 import type { FleetState } from './fleet-supervisor-policy.js';
 
 export interface FleetProcessAttestation {
@@ -27,6 +28,8 @@ const BUILTIN_FLEET_ENTRY_MARKERS = {
   daemon: { token: '__daemon', script: 'index-daemon.js' },
   dashboard: { token: '__dashboard', script: 'index-dashboard.js' },
   supervisor: { token: '__supervisor', script: 'index-supervisor.js' },
+  // Session workers: `fork(<dist>/worker.js)`, or `<binary> __worker` compiled.
+  worker: { token: '__worker', script: 'worker.js' },
 } as const;
 
 function commandLineHasArg(commandLine: string, arg: string): boolean {
@@ -98,11 +101,8 @@ export const fleetProcessIdentityRuntime: FleetProcessIdentityRuntime = {
     try { return readlinkSync(`/proc/${pid}/ns/pid`) || undefined; }
     catch { return undefined; }
   },
-  pidExists(pid): boolean {
-    try { process.kill(pid, 0); return true; } catch (error) {
-      return (error as NodeJS.ErrnoException).code !== 'ESRCH';
-    }
-  },
+  // Only ESRCH proves the pid gone; EPERM / unexpected errors stay "exists".
+  pidExists: pidNotProvablyGone,
 };
 
 /**

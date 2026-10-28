@@ -1,5 +1,5 @@
 import { execFileSync, type ChildProcess } from 'node:child_process';
-import { appendFileSync, chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { appendFileSync, chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -107,8 +107,13 @@ async function waitForSettledIdle(
   );
 }
 
-async function waitForLog(child: ChildProcess, logs: string[], needle: string): Promise<void> {
-  const deadline = Date.now() + 10_000;
+async function waitForLog(
+  child: ChildProcess,
+  logs: string[],
+  needle: string,
+  timeoutMs = 10_000,
+): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     if (logs.some(entry => entry.includes(needle))) return;
     if (child.exitCode !== null || child.signalCode !== null) {
@@ -234,9 +239,9 @@ setInterval(() => {}, 1_000);
       larkAppSecret: 'secret',
     } satisfies DaemonToWorker);
 
-    await waitForLog(child, logs, 'model_backend_variant="max"');
+    await waitForLog(child, logs, 'model_backend_variant="max"', 30_000);
     expect(logs.join('')).toContain('Spawning fresh CLI:');
-  }, 15_000);
+  }, 40_000);
 
   it('attaches a spawned OMP bridge and quiet-flushes one trailing final', async () => {
     const root = mkdtempSync(join(tmpdir(), 'botmux-worker-omp-quiet-final-'));
@@ -513,6 +518,176 @@ setInterval(() => {}, 1_000);
     expect(updates[0]?.status).toBe('working');
     expect(updates.at(-1)?.status).toBe('idle');
   }, 20_000);
+
+  it('holds prompt ready while Pi 1.3.0 still animates its `⠴ Working` border line', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'botmux-worker-pi13-busy-'));
+    tempDirs.add(root);
+    const dataDir = join(root, 'session');
+    mkdirSync(dataDir, { recursive: true });
+
+    const cliSessionId = 'deadbeef-1234-4678-9abc-def012345679';
+    const piSessionsDir = join(root, '.pi', 'agent', 'sessions', dataDir.replace(/\//g, '--'));
+    mkdirSync(piSessionsDir, { recursive: true });
+    const transcriptPath = join(piSessionsDir, `20261021120000_${cliSessionId}.jsonl`);
+    writeFileSync(transcriptPath, '');
+
+    // Byte shape copied from a real Pi 1.3.0 pane: the editor's top border
+    // carries `<braille frame> Working` with no ellipsis, each part in its own
+    // SGR span, repainted every 80ms until the turn's TUI work ends.
+    const busyStopMarker = join(root, 'busy-stopped');
+    const fakePi = join(root, 'fake-pi');
+    writeFileSync(fakePi, `#!/usr/bin/env node
+const frames = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+let frame = 0;
+const spin = setInterval(() => {
+  process.stdout.write('\\x1b[6;1H\\x1b[2K\\x1b[38;5;104m── \\x1b[39m\\x1b[38;5;104m'
+    + frames[frame++ % frames.length] + '\\x1b[39m \\x1b[38;5;104mWorking\\x1b[39m\\x1b[38;5;104m '
+    + '─'.repeat(40) + '\\x1b[39m');
+}, 80);
+setTimeout(() => {
+  clearInterval(spin);
+  const stoppedAt = String(Date.now());
+  void import('node:fs').then(fs => fs.writeFileSync(${JSON.stringify(busyStopMarker)}, stoppedAt));
+  process.stdout.write('\\x1b[2J\\x1b[H' + '─'.repeat(40) + '\\n');
+}, 6_000);
+setInterval(() => {}, 1_000);
+`);
+    chmodSync(fakePi, 0o755);
+
+    const messages: WorkerToDaemon[] = [];
+    const promptReadyAt: number[] = [];
+    const logs: string[] = [];
+    const child = spawnNodeTsScript(resolve('src/worker.ts'), [], {
+      cwd: resolve('.'),
+      env: {
+        ...process.env,
+        HOME: root,
+        SESSION_DATA_DIR: dataDir,
+        BOTMUX_SESSION_ID: 'sid-worker-pi13-busy',
+        LARK_APP_ID: 'app_test',
+        LARK_APP_SECRET: 'secret',
+      },
+      stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
+    });
+    children.add(child);
+    child.on('message', raw => {
+      const message = raw as WorkerToDaemon;
+      messages.push(message);
+      if (message.type === 'prompt_ready') promptReadyAt.push(Date.now());
+    });
+    child.stdout?.on('data', chunk => logs.push(chunk.toString()));
+    child.stderr?.on('data', chunk => logs.push(chunk.toString()));
+
+    child.send({
+      type: 'init',
+      sessionId: 'sid-worker-pi13-busy',
+      chatId: 'oc_test',
+      rootMessageId: 'om_root',
+      workingDir: dataDir,
+      cliId: 'pi',
+      cliPathOverride: fakePi,
+      cliSessionId,
+      backendType: 'pty',
+      prompt: 'hello from argv',
+      larkAppId: 'app_test',
+      larkAppSecret: 'secret',
+      turnId: 'om_turn',
+    } satisfies DaemonToWorker);
+
+    await waitForLog(child, logs, 'Codex bridge fresh-empty:');
+    // Real Pi paints its busy line before it can write a final. Under load the
+    // fake's first frame can lag the bridge attach, so wait until the worker's
+    // own screen shows it before ending the turn in the transcript.
+    await waitForScreenUpdates(child, messages, 1, logs, update => /[\u2800-\u28FF] Working/.test(update.content), 'a screen showing the busy line');
+    // The transcript says the turn is over while the TUI is still busy — the
+    // exact window where Pi's transcript final precedes its busy line clearing.
+    appendFileSync(transcriptPath,
+      piTranscriptRecord('user', 'hello from argv')
+      + piTranscriptRecord('assistant', 'final answer', 'stop'));
+    await waitForLog(child, logs, 'authoritative viewport still shows busy marker; deferring prompt ready');
+
+    await waitForPromptReady(child, messages, logs);
+    const busyStoppedAt = Number(readFileSync(busyStopMarker, 'utf8'));
+    expect(promptReadyAt[0]).toBeGreaterThanOrEqual(busyStoppedAt);
+    expect(logs.join('')).not.toContain('Argv-baked first prompt has not visibly started');
+  }, 30_000);
+
+  it('does not fail open to idle at the 90s grace while the PTY is still streaming', async () => {
+    // The argv first-turn gate fails open after 90s without start evidence.
+    // Here Pi animates a busy line busyPattern does not know (a future label
+    // rename — exactly how 1.3.0 broke `Working...`), so the only remaining
+    // signal is that the PTY never goes quiet. Long by necessity: the grace
+    // is a real 90s timer inside the worker process.
+    const root = mkdtempSync(join(tmpdir(), 'botmux-worker-pi-failopen-'));
+    tempDirs.add(root);
+    const dataDir = join(root, 'session');
+    mkdirSync(dataDir, { recursive: true });
+
+    const busyStopMarker = join(root, 'busy-stopped');
+    const fakePi = join(root, 'fake-pi');
+    writeFileSync(fakePi, `#!/usr/bin/env node
+const frames = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+let frame = 0;
+const spin = setInterval(() => {
+  process.stdout.write('\\x1b[6;1H\\x1b[2K── ' + frames[frame++ % frames.length] + ' Pondering ' + '─'.repeat(40));
+}, 80);
+setTimeout(() => {
+  clearInterval(spin);
+  const stoppedAt = String(Date.now());
+  void import('node:fs').then(fs => fs.writeFileSync(${JSON.stringify(busyStopMarker)}, stoppedAt));
+  process.stdout.write('\\x1b[2J\\x1b[H' + '─'.repeat(40) + '\\n');
+}, 96_000);
+setInterval(() => {}, 1_000);
+`);
+    chmodSync(fakePi, 0o755);
+
+    const messages: WorkerToDaemon[] = [];
+    const promptReadyAt: number[] = [];
+    const logs: string[] = [];
+    const child = spawnNodeTsScript(resolve('src/worker.ts'), [], {
+      cwd: resolve('.'),
+      env: {
+        ...process.env,
+        HOME: root,
+        SESSION_DATA_DIR: dataDir,
+        BOTMUX_SESSION_ID: 'sid-worker-pi-failopen',
+        LARK_APP_ID: 'app_test',
+        LARK_APP_SECRET: 'secret',
+      },
+      stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
+    });
+    children.add(child);
+    child.on('message', raw => {
+      const message = raw as WorkerToDaemon;
+      messages.push(message);
+      if (message.type === 'prompt_ready') promptReadyAt.push(Date.now());
+    });
+    child.stdout?.on('data', chunk => logs.push(chunk.toString()));
+    child.stderr?.on('data', chunk => logs.push(chunk.toString()));
+
+    child.send({
+      type: 'init',
+      sessionId: 'sid-worker-pi-failopen',
+      chatId: 'oc_test',
+      rootMessageId: 'om_root',
+      workingDir: dataDir,
+      cliId: 'pi',
+      cliPathOverride: fakePi,
+      cliSessionId: 'deadbeef-1234-4678-9abc-def01234567a',
+      backendType: 'pty',
+      prompt: 'hello from argv',
+      larkAppId: 'app_test',
+      larkAppSecret: 'secret',
+      turnId: 'om_turn',
+    } satisfies DaemonToWorker);
+
+    await waitForLog(child, logs, 'holding fail-open until it goes quiet', 100_000);
+    expect(promptReadyAt, logs.join('')).toHaveLength(0);
+
+    await waitForPromptReady(child, messages, logs);
+    const busyStoppedAt = Number(readFileSync(busyStopMarker, 'utf8'));
+    expect(promptReadyAt[0]).toBeGreaterThanOrEqual(busyStoppedAt);
+  }, 130_000);
 
   it('defers a Pi transcript final that lands while the viewport still shows Working...', async () => {
     const root = mkdtempSync(join(tmpdir(), 'botmux-worker-pi-external-busy-'));
@@ -1098,7 +1273,7 @@ setInterval(() => {}, 1_000);
   }, 40_000);
 
   it('never lets an idle escape between the two working edges on a Grok-class first turn', async () => {
-    // Grok arms spawnArgvInitialPromptBusy (argv-baked prompt + injectsReadyHook +
+    // Grok arms spawnArgvInitialPromptBusy (argv-baked prompt +
     // reliableTurnTerminal): its FIRST ready edge is pre-execution — the argv-baked
     // first prompt is still running. markPromptReady() would otherwise publish a
     // generic snapshot (projected idle, since isPromptReady was just set true)
@@ -1190,10 +1365,31 @@ setInterval(() => {}, 1_000);
     const dataDir = join(root, 'session');
     mkdirSync(dataDir, { recursive: true });
 
+    // The test, not a clock started at pane creation, moves the fake Pi
+    // between phases. Under CI load the worker can take longer to attach than
+    // any fixed busy window (5s on 2026-10-24); a pane that already settled
+    // before attach never emits output again, so no idle edge ever arrives.
+    // Printing Working... only after attach also makes it arrive as pane
+    // output, so quiescence really fires while the viewport shows it. It goes
+    // on the bottom row, where Pi draws it above its editor: the busy guard
+    // only reads the tail of the viewport.
+    const startBusy = join(root, 'start-busy');
+    const finishBusy = join(root, 'finish-busy');
     const fakePi = join(root, 'fake-pi');
     writeFileSync(fakePi, `#!/usr/bin/env node
-process.stdout.write('Working...\\n');
-setTimeout(() => process.stdout.write('\\x1b[2J\\x1b[HDone without transcript final\\n'), 4_500);
+import('node:fs').then(({ existsSync }) => {
+  const after = (file, text, next) => {
+    const timer = setInterval(() => {
+      if (!existsSync(file)) return;
+      clearInterval(timer);
+      process.stdout.write(text);
+      next?.();
+    }, 25);
+  };
+  after(${JSON.stringify(startBusy)}, '\\x1b[999;1HWorking...', () => {
+    after(${JSON.stringify(finishBusy)}, '\\x1b[2J\\x1b[HDone without transcript final\\n');
+  });
+});
 setInterval(() => {}, 1_000);
 `);
     chmodSync(fakePi, 0o755);
@@ -1239,14 +1435,19 @@ setInterval(() => {}, 1_000);
       adoptPaneRows: 50,
     } satisfies DaemonToWorker);
 
-    const deadline = Date.now() + 3_500;
-    while (Date.now() < deadline) {
-      await new Promise(resolvePromise => setTimeout(resolvePromise, 25));
-    }
+    await waitForLog(child, logs, 'Adopt mode (tmux): observing', 20_000);
+    writeFileSync(startBusy, '');
+
+    // Quiescence fires while Working... is on screen: the adopt idle exit must
+    // defer, and the busy probe that takes over must keep deferring for as long
+    // as the marker stays (one probe interval is 3.5s).
+    await waitForLog(child, logs, 'adopt-idle: authoritative viewport still shows busy marker; deferring prompt ready');
+    await new Promise(resolvePromise => setTimeout(resolvePromise, 4_500));
     expect(messages.some(message => message.type === 'prompt_ready'), JSON.stringify(messages)).toBe(false);
 
+    writeFileSync(finishBusy, '');
     await waitForPromptReady(child, messages, logs);
-  }, 15_000);
+  }, 50_000);
 
   it.skipIf(!tmuxAvailable)('publishes the adopted tmux pane CLI pid and start identity before prompt_ready', async () => {
     const root = mkdtempSync(join(tmpdir(), 'botmux-worker-adopt-attest-'));

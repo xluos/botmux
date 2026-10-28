@@ -28,15 +28,23 @@ import { existsSync, readFileSync, writeFileSync, rmSync, mkdirSync } from 'node
 import { join } from 'node:path';
 import { homedir } from 'node:os';
 import { WebSocket } from 'ws';
+import { MIN_POLL_REQUEST_BUDGET_MS } from './core/codex-poll-budget.js';
 import {
   CODEX_OUTPUT_LIMIT_ERROR_CODE,
+  CODEX_CAPACITY_ERROR_CODE,
+  isCodexCapacityError,
   isExactCodexOutputLimitError,
 } from './services/codex-transcript.js';
+import type { CodexServiceTier } from './services/codex-service-tier.js';
+import { validateCodexServiceTier, type CodexServiceTierCheck } from './services/codex-service-tier-catalog.js';
+import { pidIsSignalable } from './utils/process-alive.js';
+import { PROCESS_TABLE_MAX_BUFFER } from './utils/exec-limits.js';
 
 type Json = Record<string, any>;
 type LogFn = (msg: string) => void;
 
 function rpcTurnErrorCode(error: unknown, fallback = 'rpc_turn_failed'): string {
+  if (isCodexCapacityError(error)) return CODEX_CAPACITY_ERROR_CODE;
   if (isExactCodexOutputLimitError(error)) return CODEX_OUTPUT_LIMIT_ERROR_CODE;
   if (error && typeof error === 'object') {
     const record = error as Record<string, unknown>;
@@ -61,9 +69,7 @@ async function findFreePort(): Promise<number> {
   });
 }
 
-function isAlive(pid: number): boolean {
-  try { process.kill(pid, 0); return true; } catch { return false; }
-}
+const isAlive = pidIsSignalable;
 
 /** Kill the whole process group (node wrapper + its native app-server child).
  *  The app-server is spawned `detached`, so its pid is the group leader. */
@@ -86,6 +92,7 @@ export interface CodexRpcEngineOpts {
   model?: string;
   modelBackendVariant?: 'standard' | 'max';
   reasoningEffort?: string;
+  serviceTier?: CodexServiceTier;
   /** Feature gates owned by the app-server process (the viewer TUI does not
    *  execute model tools in RPC mode). */
   appServerFeatures?: string[];
@@ -111,10 +118,17 @@ export interface CodexRpcEngineDependencies {
   /** Process boundary kept injectable so launch argv/env can be verified without
    * relying on platform-specific process introspection such as Linux /proc. */
   spawnProcess(command: string, args: string[], options: SpawnOptions): ChildProcess;
+  validateServiceTier?(input: {
+    cliBin: string;
+    env: NodeJS.ProcessEnv;
+    model?: string;
+    serviceTier?: CodexServiceTier;
+  }): Promise<CodexServiceTierCheck>;
 }
 
 const DEFAULT_DEPENDENCIES: CodexRpcEngineDependencies = {
   spawnProcess: (command, args, options) => spawn(command, args, options),
+  validateServiceTier: validateCodexServiceTier,
 };
 
 export interface CodexRpcTurnIdentity {
@@ -158,15 +172,6 @@ const MARKER_DIR = join(homedir(), '.botmux', 'data', 'codex-rpc-app-servers');
  *  FIRST turn on a cold app-server pays MCP/model-list startup latency. */
 const REQUEST_TIMEOUT_MS = 60_000;
 
-/** Floor for a metadata-poll iteration's per-request budget. Below this, the
- *  poll deadline is effectively reached: issuing a thread/read with a
- *  sub-floor client timeout would reliably time out (and REJECT, not return)
- *  before even a fast response lands, and that rejection would escape the poll
- *  loop instead of degrading to "not found". Guards waitForThreadPreview /
- *  waitForThreadUpdatedAfter against a flaky end-of-window request. 50ms is
- *  comfortably above localhost RPC round-trip yet negligible vs the callers'
- *  200ms–10s budgets. */
-const MIN_POLL_REQUEST_BUDGET_MS = 50;
 
 export class CodexRpcEngine {
   private child?: ChildProcess;
@@ -299,6 +304,13 @@ export class CodexRpcEngine {
   /** Spawn the app-server, connect, and complete the initialize handshake. */
   async start(): Promise<void> {
     this.reapStaleAppServer();
+    const tierCheck = await (this.dependencies.validateServiceTier ?? validateCodexServiceTier)({
+      cliBin: this.opts.cliBin,
+      env: this.opts.env,
+      model: this.opts.model,
+      serviceTier: this.opts.serviceTier,
+    });
+    if (!tierCheck.ok) throw new Error(`Codex service tier rejected: ${tierCheck.error}`);
     this.port = await findFreePort();
     const featureArgs = (this.opts.appServerFeatures ?? []).flatMap(feature => ['--enable', feature]);
     const configArgs = [...(this.opts.appServerConfig ?? [])]
@@ -353,7 +365,8 @@ export class CodexRpcEngine {
     // therefore silently drifts model/provider whenever the app-server default
     // changed between restarts. Verified on codex-cli 0.145.0 + traecli 0.200.19.
     // The safe path is to send nothing model-related and let the app-server
-    // restore the full persisted triple. Fresh thread/start still stamps both.
+    // restore the full persisted triple. serviceTier is a thread-level tier and
+    // remains the only non-model resume override. Fresh thread/start stamps it too.
     const params: Json = { ...this.threadParams(true), threadId, excludeTurns: true };
     delete params.serviceName; // resume keeps the original thread's identity
     const r = await this.request('thread/resume', params);
@@ -383,6 +396,7 @@ export class CodexRpcEngine {
       ephemeral: false,
       persistExtendedHistory: true,
       config,
+      ...(this.opts.serviceTier ? { serviceTier: this.opts.serviceTier } : {}),
     };
   }
 
@@ -549,18 +563,40 @@ export class CodexRpcEngine {
     this.deferredUnownedTerminals.clear();
     try { this.ws?.close(); } catch { /* already gone */ }
     const pid = this.child?.pid;
-    if (pid) {
+    if (pid && this.child?.exitCode == null && this.child?.signalCode == null) {
       // Bounded SIGTERM → SIGKILL: don't leave a stubborn child as an untracked
       // orphan. The marker is removed by the child 'exit' handler (confirmed
       // dead), NOT here — if the child ignores SIGTERM and this worker then dies,
       // the surviving marker lets the next incarnation reap it (P1-2).
       try { killGroup(pid, 'SIGTERM'); } catch { /* already gone */ }
-      const t = setTimeout(() => { if (isAlive(pid)) { try { killGroup(pid, 'SIGKILL'); } catch { /* */ } } }, 2000);
+      const child = this.child!;
+      const t = setTimeout(() => {
+        if (child.exitCode == null && child.signalCode == null && isAlive(pid)) {
+          try { killGroup(pid, 'SIGKILL'); } catch { /* */ }
+        }
+      }, 2000);
+      child.once('exit', () => clearTimeout(t));
       t.unref?.();
     } else {
       this.removeMarkerIfOwned();
     }
     this.failAll(new Error('engine stopped'));
+  }
+
+  /** Keep this owner alive until the actual native child exit is observed.
+   * stop() remains synchronous for restart callers; explicit close awaits this. */
+  async stopAndWait(timeoutMs = 3_500): Promise<boolean> {
+    const child = this.child;
+    if (!child) { this.stop(); return false; }
+    const exited = child.exitCode != null || child.signalCode != null;
+    if (exited) { this.stop(); return true; }
+    return new Promise<boolean>(resolve => {
+      const done = (ok: boolean) => { clearTimeout(timer); child.off('exit', onExit); resolve(ok); };
+      const onExit = () => done(true);
+      const timer = setTimeout(() => done(false), timeoutMs);
+      child.once('exit', onExit);
+      this.stop();
+    });
   }
 
   // ---- app-server orphan marker (P0 teardown) ------------------------------
@@ -579,7 +615,7 @@ export class CodexRpcEngine {
     let argv = '';
     try { argv = readFileSync(`/proc/${pid}/cmdline`, 'utf8').replace(/\0/g, ' '); }
     catch {
-      try { argv = execFileSync('ps', ['-o', 'args=', '-p', String(pid)], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }); }
+      try { argv = execFileSync('ps', ['-o', 'args=', '-p', String(pid)], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], maxBuffer: PROCESS_TABLE_MAX_BUFFER }); }
       catch { return false; }
     }
     if (!/\bapp-server\b/.test(argv)) return false;

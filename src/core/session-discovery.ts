@@ -9,12 +9,20 @@ import { readdirSync, readFileSync, readlinkSync, realpathSync } from 'node:fs';
 import { homedir, platform } from 'node:os';
 import { basename, join } from 'node:path';
 import type { CliId } from '../adapters/cli/types.js';
+import { CLI_DISPLAY_NAMES } from '../adapters/cli/display-names.js';
 import { executableBasename } from '../adapters/cli/runtime.js';
+import { readClaudeSessionMeta } from '../services/claude-transcript.js';
 import { findCodexRolloutByPid } from '../services/codex-transcript.js';
 import { findCocoSessionByPid } from '../services/coco-transcript.js';
-import { findTraexRolloutByPid } from '../services/traex-transcript.js';
+import { findTraexRolloutByPid, readTraexThreadTitle } from '../services/traex-transcript.js';
 import { tmuxEnv } from '../setup/ensure-tmux.js';
 import { herdrExecutable } from '../utils/herdr-executable.js';
+import { herdrPaneGrid } from '../utils/herdr-pane-grid.js';
+import { cleanLiveAdoptTitle } from '../utils/live-title.js';
+import { LSOF_EXEC_OPTIONS } from '../utils/process-open-files.js';
+import { PROCESS_TABLE_MAX_BUFFER } from '../utils/exec-limits.js';
+import { PROC_STAT_STARTTIME_INDEX, procStatFieldsAfterComm } from '../utils/proc-stat.js';
+import { validateOrcaAdoptTarget, type OrcaAdoptableSession } from './orca-adopt-discovery.js';
 
 // macOS 没有 /proc，所以走 ps/lsof/pgrep 兜底。Linux 仍优先走 /proc 快路径。
 const IS_LINUX = platform() === 'linux';
@@ -37,6 +45,31 @@ export interface AdoptableSession {
   startedAt?: number;        // epoch ms
   paneCols: number;          // current pane width
   paneRows: number;          // current pane height
+  /** Display name. Herdr: pane label (any CLI) > Claude terminal title
+   *  (generic / path-like titles dropped), cleaned to one line of at most 80
+   *  code points. TraeX (tmux / herdr without a label): the native thread
+   *  title from its state DB, same cleaning, unless the thread is botmux-origin
+   *  (see traexLiveTitle). Absent → callers show the cwd basename. */
+  title?: string;
+  /** Herdr workspace / tab holding the pane, copied from the `agent list` /
+   *  `pane list` records discovery already reads (no extra herdr call). */
+  herdrWorkspaceId?: string;
+  herdrTabId?: string;
+  /** Herdr: the manual pane label alone, cleaned like `title`. */
+  herdrPaneLabel?: string;
+  /** Herdr: the CLI's own title alone — the filtered Claude terminal title (it
+   *  already carries a `/rename` name or Claude's auto title) or the TraeX
+   *  thread title — cleaned like `title`. `title` = herdrPaneLabel ?? this. */
+  herdrNativeTitle?: string;
+  /** Herdr names resolved by the /adopt picker's live enrichment
+   *  (services/adopt-live-enrich), never by discovery. The tab pair is set
+   *  together, only when the tab was found. */
+  herdrWorkspaceLabel?: string;
+  herdrTabLabel?: string;
+  /** The tab label is herdr's position number, not a name the user gave it. */
+  herdrTabAutoNamed?: boolean;
+  /** Claude: the first real user prompt of the transcript, cleaned like `title`. */
+  herdrFirstPrompt?: string;
 }
 
 // ─── CLI process name → CliId mapping ────────────────────────────────────────
@@ -261,7 +294,10 @@ export function readCmdline(pid: number): string[] {
     return readFileSync(`/proc/${pid}/cmdline`, 'utf-8').split('\0').filter(Boolean);
   } catch {
     try {
-      const out = execFileSync('ps', ['-o', 'args=', '-p', String(pid)], { encoding: 'utf-8', stdio: ['ignore', 'pipe', 'ignore'] });
+      const out = execFileSync('ps', ['-o', 'args=', '-p', String(pid)], {
+        encoding: 'utf-8', stdio: ['ignore', 'pipe', 'ignore'],
+        maxBuffer: PROCESS_TABLE_MAX_BUFFER,
+      });
       return out.trim().split(/\s+/).filter(Boolean);
     } catch { return []; }
   }
@@ -359,10 +395,7 @@ export function readCwd(pid: number): string | undefined {
     }
   }
   try {
-    const out = execSync(`lsof -a -d cwd -p ${pid} -Fn`, {
-      encoding: 'utf-8',
-      stdio: ['pipe', 'pipe', 'pipe'],
-    });
+    const out = execFileSync('lsof', ['-n', '-P', '-a', '-d', 'cwd', '-p', String(pid), '-Fn'], LSOF_EXEC_OPTIONS);
     for (const line of out.split('\n')) {
       if (line.startsWith('n')) return line.slice(1);
     }
@@ -416,11 +449,10 @@ export function readProcessStartTime(pid: number): number | undefined {
   if (IS_LINUX) {
     try {
       const stat = readFileSync(`/proc/${pid}/stat`, 'utf-8');
-      // comm（字段 2）用括号包裹且可能含空格/括号，slice 到最后一个 ')' 之后，
-      // 让后续字段偏移稳定。')' 之后第一个字段是 state（字段 3），所以 starttime
-      // （字段 22）对应这里的下标 19。
-      const afterComm = stat.slice(stat.lastIndexOf(')') + 1).trim().split(/\s+/);
-      const starttimeTicks = Number(afterComm[19]);
+      // comm（字段 2）用括号包裹且可能含空格/括号，procStatFieldsAfterComm 在最后一个
+      // ')' 之后切分，让后续字段偏移稳定；starttime（字段 22）对应下标 19。
+      const afterComm = procStatFieldsAfterComm(stat) ?? [];
+      const starttimeTicks = Number(afterComm[PROC_STAT_STARTTIME_INDEX]);
       const btime = readBootTimeSeconds();
       if (Number.isFinite(starttimeTicks) && btime !== undefined) {
         return Math.round((btime + starttimeTicks / clockTicksPerSecond()) * 1000);
@@ -432,6 +464,7 @@ export function readProcessStartTime(pid: number): number | undefined {
   try {
     const out = execFileSync('ps', ['-o', 'lstart=', '-p', String(pid)], {
       encoding: 'utf-8', stdio: ['ignore', 'pipe', 'ignore'],
+      maxBuffer: PROCESS_TABLE_MAX_BUFFER,
     }).trim();
     if (out) {
       const ms = Date.parse(out);
@@ -458,6 +491,7 @@ export function getChildPids(pid: number): number[] {
   try {
     const out = execSync('ps -A -o pid= -o ppid=', {
       encoding: 'utf-8',
+      maxBuffer: PROCESS_TABLE_MAX_BUFFER,
       stdio: ['pipe', 'pipe', 'pipe'],
     });
     const children: number[] = [];
@@ -482,7 +516,7 @@ export function getChildPids(pid: number): number[] {
  * Recursively search the process tree (up to `maxDepth` levels) for a known CLI binary.
  * Returns { pid, cliId } of the first match, or undefined.
  */
-function findCliProcess(
+export function findCliProcess(
   rootPid: number,
   maxDepth: number,
   filterCliId?: CliId,
@@ -661,24 +695,7 @@ export function scheduleWrapperRealCliPid(launcherPid: number, deps: WrapperReal
   deps.schedule(tick, intervalMs);
 }
 
-/**
- * Try to read Claude Code session metadata from ~/.claude/sessions/<PID>.json.
- * Returns { sessionId, cwd, startedAt } or undefined.
- */
-export function readClaudeSessionMeta(pid: number): { sessionId?: string; cwd?: string; startedAt?: number } | undefined {
-  try {
-    const metaPath = join(homedir(), '.claude', 'sessions', `${pid}.json`);
-    const raw = readFileSync(metaPath, 'utf-8');
-    const data = JSON.parse(raw) as Record<string, unknown>;
-    return {
-      sessionId: typeof data.sessionId === 'string' ? data.sessionId : undefined,
-      cwd: typeof data.cwd === 'string' ? data.cwd : undefined,
-      startedAt: typeof data.startedAt === 'number' ? data.startedAt : undefined,
-    };
-  } catch {
-    return undefined;
-  }
-}
+export { readClaudeSessionMeta } from '../services/claude-transcript.js';
 
 
 function realpathMaybe(path: string): string {
@@ -836,6 +853,53 @@ function herdrAgentSessionId(agent: any): string | undefined {
   return HERDR_SESSION_UUID_RE.exec(value)?.[1];
 }
 
+/** Live display name for a TraeX pane: its native thread title from the state
+ * DB — already origin-filtered by readTraexThreadTitle, so a botmux-spawned
+ * thread yields undefined (cwd basename) instead of its Lark envelope — cleaned
+ * with the same one-line / no-tag policy as herdr titles. Exported for the
+ * zellij discovery path. */
+export function traexLiveTitle(sessionId: string | undefined): string | undefined {
+  return sessionId ? cleanLiveAdoptTitle(readTraexThreadTitle(sessionId)) : undefined;
+}
+
+/** The Claude terminal title unless it is generic (`Claude Code`, the CLI
+ * display name, the herdr agent kind) or path-like. Other CLIs' terminal titles
+ * have no known shape, so they never contribute. */
+function claudeTerminalTitle(terminalTitle: unknown, cliId: CliId, agentKind: unknown): string | undefined {
+  if (cliId !== 'claude-code') return undefined;
+  const title = cleanLiveAdoptTitle(terminalTitle);
+  if (!title || title.startsWith('/') || title.startsWith('~')) return undefined;
+  const generic = ['claude code', CLI_DISPLAY_NAMES[cliId].toLowerCase()];
+  if (typeof agentKind === 'string') generic.push(agentKind.toLowerCase());
+  return generic.includes(title.toLowerCase()) ? undefined : title;
+}
+
+/** Display fields for a herdr pane: the manual pane label (any CLI), the native
+ * title (Claude terminal title; TraeX thread title, only looked up when no label
+ * would win over it) and `title` = label ?? native title. Missing fields (older
+ * herdr) → no keys, and callers fall back to the cwd basename. */
+function herdrLiveTitleFields(
+  label: unknown,
+  terminalTitle: unknown,
+  cliId: CliId,
+  agentKind: unknown,
+  sessionId: string | undefined,
+): Pick<AdoptableSession, 'title' | 'herdrPaneLabel' | 'herdrNativeTitle'> {
+  const paneLabel = cleanLiveAdoptTitle(label);
+  const nativeTitle = claudeTerminalTitle(terminalTitle, cliId, agentKind)
+    ?? (!paneLabel && cliId === 'traex' ? traexLiveTitle(sessionId) : undefined);
+  const title = paneLabel ?? nativeTitle;
+  return {
+    ...(title ? { title } : {}),
+    ...(paneLabel ? { herdrPaneLabel: paneLabel } : {}),
+    ...(nativeTitle ? { herdrNativeTitle: nativeTitle } : {}),
+  };
+}
+
+function herdrIdField(value: unknown): string | undefined {
+  return typeof value === 'string' && value ? value : undefined;
+}
+
 function discoverHerdrAdoptableSessions(filterCliId?: CliId, filterExecutable?: string): AdoptableSession[] {
   const rawSessions = herdrJson(['session', 'list', '--json']);
   const sessions = extractHerdrSessions(rawSessions).filter((s: any) => {
@@ -846,6 +910,13 @@ function discoverHerdrAdoptableSessions(filterCliId?: CliId, filterExecutable?: 
   for (const session of sessions) {
     const sessionName = session.name as string;
     const rawAgents = herdrJson(['--session', sessionName, 'agent', 'list']);
+    // `agent list` carries no pane label, so list panes up front: the same
+    // single call feeds agent-row titles and the supplement pass below.
+    const panes = extractHerdrPanes(herdrJson(['--session', sessionName, 'pane', 'list']));
+    const paneById = new Map<string, any>();
+    for (const pane of panes) {
+      if (typeof pane?.pane_id === 'string') paneById.set(pane.pane_id, pane);
+    }
     const discoveredPaneIds = new Set<string>();
     for (const agent of extractHerdrAgents(rawAgents)) {
       const cliId = herdrAgentCliId(agent, filterCliId, filterExecutable);
@@ -875,6 +946,17 @@ function discoverHerdrAdoptableSessions(filterCliId?: CliId, filterExecutable?: 
       const claudeMeta = cliId === 'claude-code'
         ? (cliPid ? readClaudeSessionMeta(cliPid) : undefined) ?? findUniqueClaudeSessionByCwd(cwd)
         : undefined;
+      const grid = herdrPaneGrid(rawInfo);
+      const pane = paneById.get(paneId);
+      const workspaceId = herdrIdField(agent?.workspace_id) ?? herdrIdField(pane?.workspace_id);
+      const tabId = herdrIdField(agent?.tab_id) ?? herdrIdField(pane?.tab_id);
+      const titleFields = herdrLiveTitleFields(
+        pane?.label,
+        typeof agent?.terminal_title_stripped === 'string' ? agent.terminal_title_stripped : pane?.terminal_title_stripped,
+        cliId,
+        agent?.agent,
+        sessionId,
+      );
       discoveredPaneIds.add(paneId);
       results.push({
         source: 'herdr',
@@ -888,8 +970,12 @@ function discoverHerdrAdoptableSessions(filterCliId?: CliId, filterExecutable?: 
         sessionId: sessionId ?? claudeMeta?.sessionId,
         cwd,
         startedAt: claudeMeta?.startedAt ?? (cliPid ? readProcessStartTime(cliPid) : undefined),
-        paneCols: 200,
-        paneRows: 50,
+        // Herdr's CLI reports no terminal width; the pane PTY is the source.
+        paneCols: grid?.cols ?? 200,
+        paneRows: grid?.rows ?? 50,
+        ...(workspaceId ? { herdrWorkspaceId: workspaceId } : {}),
+        ...(tabId ? { herdrTabId: tabId } : {}),
+        ...titleFields,
       });
     }
 
@@ -897,8 +983,7 @@ function discoverHerdrAdoptableSessions(filterCliId?: CliId, filterExecutable?: 
     // agent_status=unknown (its hook integration has not emitted state yet).
     // Supplement agent-list discovery from pane process-info so such live CLIs
     // remain adoptable; plain shell panes naturally fail cliId detection.
-    const rawPanes = herdrJson(['--session', sessionName, 'pane', 'list']);
-    for (const pane of extractHerdrPanes(rawPanes)) {
+    for (const pane of panes) {
       const paneId = typeof pane?.pane_id === 'string' ? pane.pane_id : undefined;
       if (!paneId || discoveredPaneIds.has(paneId)) continue;
       const rawInfo = herdrJson(['--session', sessionName, 'pane', 'process-info', '--pane', paneId]);
@@ -913,6 +998,10 @@ function discoverHerdrAdoptableSessions(filterCliId?: CliId, filterExecutable?: 
       else if (process.cliId === 'codex') sessionId = findCodexRolloutByPid(process.pid)?.cliSessionId;
       else if (process.cliId === 'coco') sessionId = findCocoSessionByPid(process.pid)?.sessionId;
       const claudeMeta = process.cliId === 'claude-code' ? readClaudeSessionMeta(process.pid) : undefined;
+      const grid = herdrPaneGrid(rawInfo);
+      const workspaceId = herdrIdField(pane?.workspace_id);
+      const tabId = herdrIdField(pane?.tab_id);
+      const titleFields = herdrLiveTitleFields(pane?.label, pane?.terminal_title_stripped, process.cliId, pane?.agent, sessionId);
       results.push({
         source: 'herdr',
         herdrSessionName: sessionName,
@@ -925,15 +1014,21 @@ function discoverHerdrAdoptableSessions(filterCliId?: CliId, filterExecutable?: 
         sessionId: sessionId ?? claudeMeta?.sessionId,
         cwd,
         startedAt: claudeMeta?.startedAt ?? readProcessStartTime(process.pid),
-        paneCols: 200,
-        paneRows: 50,
+        paneCols: grid?.cols ?? 200,
+        paneRows: grid?.rows ?? 50,
+        ...(workspaceId ? { herdrWorkspaceId: workspaceId } : {}),
+        ...(tabId ? { herdrTabId: tabId } : {}),
+        ...titleFields,
       });
     }
   }
   return results;
 }
 
-export function adoptTargetLabel(target: AdoptableSession | NonNullable<import('./types.js').DaemonSession['adoptedFrom']>): string {
+export function adoptTargetLabel(target: AdoptableSession | OrcaAdoptableSession | NonNullable<import('./types.js').DaemonSession['adoptedFrom']>): string {
+  if (target.source === 'orca') {
+    return `orca:${target.orcaTerminalTitle || target.orcaTerminalHandle || '?'}`;
+  }
   if (target.source === 'herdr') {
     const sessionName = target.herdrSessionName ?? 'herdr';
     const pane = target.herdrPaneId ?? target.herdrTarget ?? target.herdrAgentName ?? 'agent';
@@ -1015,6 +1110,7 @@ function resolveAdoptableSessionForPane(
 
   // 5. Try to read CLI session metadata
   let sessionId: string | undefined;
+  let title: string | undefined;
   let startedAt: number | undefined;
   if (match.cliId === 'claude-code') {
     const meta = readClaudeSessionMeta(cliPid);
@@ -1040,7 +1136,10 @@ function resolveAdoptableSessionForPane(
     // path matcher (~/.trae/cli/sessions/...). Worker-side re-probes by
     // pid as a fallback, so undefined here is acceptable.
     const rollout = findTraexRolloutByPid(cliPid);
-    if (rollout) sessionId = rollout.cliSessionId;
+    if (rollout) {
+      sessionId = rollout.cliSessionId;
+      title = traexLiveTitle(sessionId);
+    }
   }
 
   // 5b. Fall back to the CLI process's own start time for uptime. Without
@@ -1065,6 +1164,7 @@ function resolveAdoptableSessionForPane(
     startedAt,
     paneCols: dims.cols,
     paneRows: dims.rows,
+    ...(title ? { title } : {}),
   };
 }
 
@@ -1244,16 +1344,32 @@ export function validateHerdrAdoptTarget(
 }
 
 export function validateAdoptTarget(
-  target: AdoptableSession | NonNullable<import('./types.js').DaemonSession['adoptedFrom']>,
+  target: AdoptableSession | OrcaAdoptableSession | NonNullable<import('./types.js').DaemonSession['adoptedFrom']>,
   filterExecutable?: string,
 ): boolean {
   return validateAdoptTargetState(target, filterExecutable) === 'alive';
 }
 
 export function validateAdoptTargetState(
-  target: AdoptableSession | NonNullable<import('./types.js').DaemonSession['adoptedFrom']>,
+  target: AdoptableSession | OrcaAdoptableSession | NonNullable<import('./types.js').DaemonSession['adoptedFrom']>,
   filterExecutable?: string,
 ): AdoptValidationResult {
+  if (target.source === 'orca') {
+    // Orca reports only an agent kind, so it cannot prove that a terminal is
+    // running the configured custom distribution. Keep restore as strict as
+    // initial discovery instead of silently widening the match after restart.
+    if (filterExecutable) return 'missing';
+    if (!target.orcaTerminalHandle || !target.orcaWorktreeId || !target.orcaAgentIdentity) return 'missing';
+    return validateOrcaAdoptTarget({
+      orcaTerminalHandle: target.orcaTerminalHandle,
+      orcaPtyId: target.orcaPtyId,
+      orcaIncarnationId: target.orcaIncarnationId,
+      orcaExecutionHostId: target.orcaExecutionHostId,
+      orcaWorktreeId: target.orcaWorktreeId,
+      orcaAgentIdentity: target.orcaAgentIdentity,
+      orcaInstance: target.orcaInstance ?? 'relay',
+    });
+  }
   if (target.source === 'herdr') {
     const pid = 'originalCliPid' in target
       ? target.originalCliPid
