@@ -9166,11 +9166,7 @@ ipcRoute('POST', '/api/asks', async (req, res) => {
     // p2pOpen 的 bot 在私聊里会出现「对方点不动按钮」，留痕便于排查。
     logger.warn(`[ask:${boundAsk.larkAppId}] no active session for ${boundAsk.sessionId.substring(0, 8)}; chatType unknown (p2pOpen answer gate falls back to allowlist)`);
   }
-  if (boundAsk.groupMembersCanAnswer && (!askSession || askChatType !== 'group' || documentDelivery || asyncCaller)) {
-    return jsonRes(res, 400, { ok: false, error: 'invalid_group_audience' });
-  }
   const askInput = {
-    groupMembersCanAnswer: boundAsk.groupMembersCanAnswer,
     larkAppId: boundAsk.larkAppId,
     chatId: boundAsk.chatId,
     rootMessageId: boundAsk.rootMessageId,

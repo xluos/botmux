@@ -206,12 +206,3 @@ describe('parseAskBody — requestId / originKind (invocation identity)', () => 
     expect('error' in parseAskBody(validBody({ originKind: {} }))).toBe(true);
   });
 });
-
-describe('group member audience admission', () => {
-  it('only accepts a boolean for explicit asks', () => {
-    expect(parseAskBody(validBody({ originKind: 'explicit', groupMembersCanAnswer: true }))).toMatchObject({ groupMembersCanAnswer: true });
-    for (const invalid of [{ originKind: 'hook', groupMembersCanAnswer: true }, { originKind: 'explicit', groupMembersCanAnswer: 'true' }]) {
-      expect(parseAskBody(validBody(invalid))).toEqual({ error: 'unsupported_fields' });
-    }
-  });
-});

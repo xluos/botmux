@@ -181,23 +181,21 @@ export function setCanTalkChecker(
  *  `botmux ask` is a talk-level interaction (answering the agent's question),
  *  so it follows the canTalk gate — not the stricter canOperate / allowedUsers.
  *  `actor` is only supplied by the text-reply path; card clicks omit it. */
-function isAuthorizedToAnswer(ask: InternalPending, by: string, actor?: AskAnswerActor, verifiedGroupMember?: boolean): boolean {
+function isAuthorizedToAnswer(ask: InternalPending, by: string, actor?: AskAnswerActor): boolean {
   if (ask.answererOpenId && ask.answererOpenId !== by) return false;
   if (ask.deliveryTarget && (ask.deliveryTarget.openId !== by || actor?.botSender)) return false;
-  if (verifiedGroupMember && ask.groupMembersCanAnswer && ask.chatType === 'group'
-    && (ask.originKind === 'explicit' || ask.originKind === 'host_explicit') && !ask.answererOpenId && !ask.deliveryTarget) return true;
   return canTalkChecker?.(ask.larkAppId, ask.chatId, by, ask.deliveryTarget ? 'p2p' : ask.chatType, actor) ?? false;
 }
 
 function gateAskDecision(
   ask: InternalPending | undefined,
-  input: { nonce?: string; by: string; actor?: AskAnswerActor; verifiedGroupMember?: boolean },
+  input: { nonce?: string; by: string; actor?: AskAnswerActor },
 ): Exclude<AskClickOutcome, 'accepted' | 'toggled' | 'needs_empty_confirm'> | 'ready' {
   const gate = gateHumanDecisionAttempt({
     exists: !!ask,
     nonceMatches: !!ask && (input.nonce === undefined || ask.nonce === input.nonce),
     settled: ask?.settled ?? false,
-    authorized: !!ask && isAuthorizedToAnswer(ask, input.by, input.actor, input.verifiedGroupMember),
+    authorized: !!ask && isAuthorizedToAnswer(ask, input.by, input.actor),
   });
   return gate === 'expired' ? 'stale' : gate;
 }
@@ -336,7 +334,6 @@ function registerAskInternal(input: CreateAskInput, hostManaged: boolean, signal
       sessionId: input.sessionId,
       chatType: input.chatType,
       answererOpenId: input.answererOpenId,
-      groupMembersCanAnswer: input.groupMembersCanAnswer,
       deliveryTarget: input.deliveryTarget ? { ...input.deliveryTarget } : undefined,
       questions: input.questions,
       replyCardTarget: input.replyCardTarget,
@@ -411,7 +408,6 @@ function sameIdentity(ask: InternalPending, input: CreateAskInput): boolean {
     ask.rootMessageId === input.rootMessageId &&
     ask.originKind === (input.originKind ?? 'hook') &&
     ask.answererOpenId === input.answererOpenId &&
-    !!ask.groupMembersCanAnswer === !!input.groupMembersCanAnswer &&
     JSON.stringify(ask.deliveryTarget) === JSON.stringify(input.deliveryTarget) &&
     questionsShape(ask.questions) === questionsShape(input.questions)
   );
@@ -595,7 +591,6 @@ function persistFromInternal(ask: InternalPending, strict = false): void {
     sessionId: ask.sessionId,
     chatType: ask.chatType,
     answererOpenId: ask.answererOpenId,
-    groupMembersCanAnswer: ask.groupMembersCanAnswer,
     deliveryTarget: ask.deliveryTarget,
     questions: ask.questions,
     customAnswers: ask.customAnswers,
@@ -630,11 +625,10 @@ export function toggleAsk(args: {
   questionIndex: number;
   key: string;
   by: string;
-  verifiedGroupMember?: boolean;
 }): AskClickOutcome {
   gcSettled();
   const ask = pending.get(args.askId);
-  const gate = gateAskDecision(ask, { nonce: args.nonce, by: args.by, verifiedGroupMember: args.verifiedGroupMember });
+  const gate = gateAskDecision(ask, { nonce: args.nonce, by: args.by });
   if (gate !== 'ready') return gate;
   if (!ask || ask.customRevision !== undefined) return 'stale';
 
@@ -678,14 +672,13 @@ export function submitAsk(args: {
   nonce: string;
   by: string;
   selections?: ReadonlyArray<ReadonlyArray<string>>;
-  verifiedGroupMember?: boolean;
   /** 空提交二次确认已通过（用户在 arm 卡片上再点了一次）。仅影响「全多选 + 全空」
    *  这一种可确认的空提交；其它情形不看它。缺省 false。 */
   confirmEmpty?: boolean;
 }): AskClickOutcome {
   gcSettled();
   const ask = pending.get(args.askId);
-  const gate = gateAskDecision(ask, { nonce: args.nonce, by: args.by, verifiedGroupMember: args.verifiedGroupMember });
+  const gate = gateAskDecision(ask, { nonce: args.nonce, by: args.by });
   if (gate !== 'ready') return gate;
   if (!ask || ask.customRevision !== undefined) return 'stale';
 
@@ -747,7 +740,7 @@ export function submitAsk(args: {
  * question. Validate the whole candidate before changing any draft or settling.
  * Revision prevents duplicate/stale callbacks from overwriting newer choices. */
 export function applyAskForm(args: {
-  askId: string; nonce: string; by: string; revision: number; verifiedGroupMember?: boolean;
+  askId: string; nonce: string; by: string; revision: number;
   fields: Record<string, unknown>;
   canRenderDraft?: (draft: PendingAsk) => boolean;
   toggle?: { questionIndex: number; key: string; custom?: boolean };
@@ -755,7 +748,7 @@ export function applyAskForm(args: {
 }): AskClickOutcome {
   gcSettled();
   const ask = pending.get(args.askId);
-  const gate = gateAskDecision(ask, { nonce: args.nonce, by: args.by, verifiedGroupMember: args.verifiedGroupMember });
+  const gate = gateAskDecision(ask, { nonce: args.nonce, by: args.by });
   if (gate !== 'ready') return gate;
   if (!ask || !supportsAskCustomInput(ask)) return 'stale';
   if (!Number.isSafeInteger(args.revision) || args.revision !== (ask.customRevision ?? 0)) return 'draft_conflict';
@@ -940,14 +933,12 @@ export function tryResolveAsk(args: {
   nonce: string;
   selected: string;
   by: string;
-  verifiedGroupMember?: boolean;
 }): AskClickOutcome {
   return submitAsk({
     askId: args.askId,
     nonce: args.nonce,
     by: args.by,
     selections: [[args.selected]],
-    verifiedGroupMember: args.verifiedGroupMember,
   });
 }
 
@@ -1048,7 +1039,6 @@ export function restorePersistedAsks(now: number = Date.now(), larkAppId?: strin
       sessionId: p.sessionId,
       chatType: p.chatType,
       answererOpenId: p.answererOpenId,
-      groupMembersCanAnswer: p.groupMembersCanAnswer,
       deliveryTarget: p.deliveryTarget,
       questions: p.questions,
       customAnswers: p.customAnswers,
