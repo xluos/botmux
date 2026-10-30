@@ -1973,6 +1973,7 @@ export const messages: Record<string, string> = {
   'card.ask.invalidated_claimant_gone': 'The session that asked is no longer waiting for this answer (its CLI exited, restarted, or the turn ended), so this card no longer accepts answers. To continue, send a message in the session.',
   'card.ask.invalidated_answer_undelivered': 'This answer did not reach the session: the CLI that asked is no longer waiting. To continue, send a message in the session.',
   'card.ask.answerable_designated_member': 'designated member only',
+  'card.ask.answerable_group_members': 'members of this chat',
   'card.ask.answerable_talk_members': 'anyone who can talk to me in this chat',
 
   // Voice summary instruction (injected into the model session)

@@ -14,7 +14,7 @@ import { applyAskForm, getAskSnapshot, submitAsk, toggleAsk, tryResolveAsk } fro
 import { logger } from '../../utils/logger.js';
 import { t, localeForBot, type Locale } from '../../i18n/index.js';
 import { askOptionLayoutForBot, type AskOptionLayout } from './ask-option-layout.js';
-import { replyMessage, sendMessage, sendUserMessage, updateMessage, uploadFile } from './client.js';
+import { isHumanOpenId, listChatMemberOpenIds, replyMessage, sendMessage, sendUserMessage, updateMessage, uploadFile } from './client.js';
 import { TRANSIENT_LARK_CODES } from './api-gate.js';
 import { TURN_REPLY_CARD_MAX_BYTES, turnReplyCardRequestBytes } from './turn-reply-card-size.js';
 import { larkCodeFromMessage, structuredLarkCode } from './lark-errors.js';
@@ -41,7 +41,7 @@ const MAX_BUTTONS_PER_ACTION_ROW = 4;
 const ASK_DISPATCH_UUID_WORST_CASE = 'ask-'.padEnd(44, '0');
 
 export interface AskCardActionData {
-  context?: { open_message_id?: string };
+  context?: { open_message_id?: string; open_chat_id?: string };
   open_message_id?: string;
   operator?: { open_id?: string };
   action?: {
@@ -62,6 +62,8 @@ export interface AskCardDispatcherDeps {
 export interface AskCardActionDeps {
   requestGrant?: typeof requestGrantForAskClicker;
   larkAppId?: string;
+  listMembers?: typeof listChatMemberOpenIds;
+  isHuman?: typeof isHumanOpenId;
 }
 
 export function createLarkAskCardDispatcher(
@@ -233,6 +235,26 @@ export async function handleAskCardAction(
   if (deps.larkAppId && pending && pending.larkAppId !== deps.larkAppId) return staleToast(locale);
   if (pending?.replyCardTarget && !replyCardAskCanAct(pending, data.context?.open_message_id ?? data.open_message_id)) return staleToast(locale);
 
+  let verifiedGroupMember = false;
+  if (pending?.groupMembersCanAnswer) {
+    const messageId = data.context?.open_message_id ?? data.open_message_id;
+    if (pending.nonce !== nonce || pending.settled || data.context?.open_chat_id !== pending.chatId
+      || !messageId || (!pending.replyCardTarget && pending.cardMessageId !== messageId)) return staleToast(locale);
+    try {
+      const verified = Promise.all([
+        (deps.listMembers ?? listChatMemberOpenIds)(pending.larkAppId, pending.chatId),
+        (deps.isHuman ?? isHumanOpenId)(pending.larkAppId, by),
+      ]).then(([members, human]) => human && members.includes(by));
+      verifiedGroupMember = await Promise.race([verified, new Promise<boolean>((_, reject) => {
+        const timer = setTimeout(() => reject(new Error('membership lookup timed out')), 1800);
+        timer.unref?.();
+      })]);
+      if (!verifiedGroupMember) return { toast: { type: 'warning', content: '仅原群成员可操作此卡片' } };
+    } catch {
+      return { toast: { type: 'warning', content: '暂时无法验证群成员身份，请稍后重试' } };
+    }
+  }
+
   /** unauthorized 不再是死胡同：复用对话路径的授权卡向 owner 申请，toast 告诉点击者
    *  「已申请、通过后再点一次」。其余 outcome 原样交给 toastForOutcome。 */
   const outcomeResponse = (outcome: AskClickOutcome) =>
@@ -241,7 +263,7 @@ export async function handleAskCardAction(
       : toastForOutcome(outcome, locale);
 
   if (value?.custom_form === 'v1' && (action === ASK_TOGGLE_ACTION || action === ASK_SUBMIT_ACTION)) {
-    const outcome = applyAskForm({ askId, nonce, by, revision: asNumber(value.revision),
+    const outcome = applyAskForm({ askId, nonce, by, ...(verifiedGroupMember ? { verifiedGroupMember } : {}), revision: asNumber(value.revision),
       fields: data.action?.form_value ?? {},
       canRenderDraft: draft => turnReplyCardRequestBytes(buildAskCard(draft), draft.deliveryTarget?.openId ?? draft.chatId,
         draft.dispatchUuid ?? ASK_DISPATCH_UUID_WORST_CASE) <= TURN_REPLY_CARD_MAX_BYTES - (draft.replyCardTarget ? 4000 : 0),
@@ -264,7 +286,7 @@ export async function handleAskCardAction(
   if (action === ASK_SELECT_ACTION) {
     const selected = asString(value?.key);
     if (!selected) return staleToast(locale);
-    const outcome = tryResolveAsk({ askId, nonce, selected, by });
+    const outcome = tryResolveAsk({ askId, nonce, selected, by, ...(verifiedGroupMember ? { verifiedGroupMember } : {}) });
     if (outcome !== 'accepted') return outcomeResponse(outcome);
     return settledCardResponse(askId, {
       kind: 'answered',
@@ -280,10 +302,10 @@ export async function handleAskCardAction(
     const key = asString(value?.key);
     if (!Number.isInteger(questionIndex) || !key) return staleToast(locale);
     const outcome = pending && supportsAskCustomInput(pending)
-      ? applyAskForm({ askId, nonce, by, revision: 0, fields: {}, toggle: { questionIndex, key },
+      ? applyAskForm({ askId, nonce, by, ...(verifiedGroupMember ? { verifiedGroupMember } : {}), revision: 0, fields: {}, toggle: { questionIndex, key },
         canRenderDraft: draft => turnReplyCardRequestBytes(buildAskCard(draft), draft.chatId, draft.dispatchUuid)
           <= TURN_REPLY_CARD_MAX_BYTES - (draft.replyCardTarget ? 4000 : 0) })
-      : toggleAsk({ askId, nonce, questionIndex, key, by });
+      : toggleAsk({ askId, nonce, questionIndex, key, by, ...(verifiedGroupMember ? { verifiedGroupMember } : {}) });
     if (outcome === 'draft_conflict') {
       const current = getAskSnapshot(askId);
       if (current) return refreshedDraftResponse(current, locale, true);
@@ -307,7 +329,7 @@ export async function handleAskCardAction(
       // 推断问题数量：找最大 qN 的 N+1
       const questionCount = guessQuestionCount(formValue);
       const selections = parseFormSelections(formValue, questionCount);
-      const outcome = submitAsk({ askId, nonce, by, selections, confirmEmpty });
+      const outcome = submitAsk({ askId, nonce, by, selections, confirmEmpty, ...(verifiedGroupMember ? { verifiedGroupMember } : {}) });
       if (outcome === 'needs_empty_confirm') return armEmptyConfirmResponse(askId, locale);
       if (outcome !== 'accepted') return outcomeResponse(outcome);
       return settledCardResponse(askId, {
@@ -321,7 +343,7 @@ export async function handleAskCardAction(
     // 累积按钮路径。submitAsk 在鉴权 + nonce + 单选约束全过后，若「全多选且全空」返回
     // needs_empty_confirm（防手滑）——空提交二次确认的判定全在 broker 内，卡片不再自行
     // 预检（否则会绕过 nonce/canTalk，且需重复 mixed-question 规则）。
-    const outcome = submitAsk({ askId, nonce, by, confirmEmpty });
+    const outcome = submitAsk({ askId, nonce, by, confirmEmpty, ...(verifiedGroupMember ? { verifiedGroupMember } : {}) });
     if (outcome === 'needs_empty_confirm') return armEmptyConfirmResponse(askId, locale);
     if (outcome !== 'accepted') return outcomeResponse(outcome);
     const updated = getAskSnapshot(askId);
@@ -856,6 +878,7 @@ function approverSummary(ask: PendingAsk, locale?: Locale): string {
     }
     return `<at id=${ask.answererOpenId}></at>`;
   }
+  if (ask.groupMembersCanAnswer) return t('card.ask.answerable_group_members', undefined, locale);
   // 答复权限 = canTalk：谁能在该群跟 bot 说话谁就能答。卡片统一显示「本群可对话成员」，
   // 不再按 open_id 列名单（鉴权在 broker 点击时按 canTalk 判定）。
   return t('card.ask.answerable_talk_members', undefined, locale);

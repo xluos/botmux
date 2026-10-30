@@ -16327,7 +16327,7 @@ async function cmdAsk(sub: string, rest: string[]): Promise<void> {
   const timeoutRaw = argValue(rest, '--timeout');
   const useJson = rest.includes('--json') || questionsFile !== undefined;
   const multiSelect = rest.includes('--multi');
-  const positionalArgs = positionals(rest, ['--json', '--multi']);
+  const positionalArgs = positionals(rest, ['--json', '--multi', '--group-members']);
 
   let options;
   let questions;
@@ -16383,6 +16383,7 @@ async function cmdAsk(sub: string, rest: string[]): Promise<void> {
     timeoutMs,
     // Stable invocation identity: reconnect without posting a second card.
     originKind: 'explicit',
+    ...(rest.includes('--group-members') ? { groupMembersCanAnswer: true } : {}),
     requestId: randomUUID(),
     ...(liveAskOrigin?.turnId ? { originTurnId: liveAskOrigin.turnId } : {}),
     ...(liveAskOrigin?.dispatchAttempt !== undefined

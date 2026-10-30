@@ -147,6 +147,8 @@ export interface CreateAskInput {
   /** Optional exact responder lock for host-owned approval asks. Ordinary
    * agent asks omit it and retain the existing canTalk-any-member policy. */
   answererOpenId?: string;
+  /** Explicit group-card audience, authenticated by the card handler. */
+  groupMembersCanAnswer?: boolean;
 }
 
 /** Daemon-internal state for a pending ask. Not exported on the IPC boundary —
@@ -173,6 +175,8 @@ export interface PendingAsk {
   chatType?: 'group' | 'p2p';
   /** When present, only this app-scoped open_id may settle the ask. */
   answererOpenId?: string;
+  /** Explicit group-card audience, authenticated by the card handler. */
+  groupMembersCanAnswer?: boolean;
   /** 问题列表，替代旧的 `options` + `prompt`。 */
   questions: ReadonlyArray<AskQuestion>;
   /** 当前已勾选答案快照。仅 daemon/card 内部使用；CLI IPC 边界不暴露。 */

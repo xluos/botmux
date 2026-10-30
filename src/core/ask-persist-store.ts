@@ -69,6 +69,7 @@ export interface PersistedAsk {
   chatType?: 'group' | 'p2p';
   /** Optional app-scoped responder lock for host-owned approval asks. */
   answererOpenId?: string;
+  groupMembersCanAnswer?: boolean;
   deliveryTarget?: CreateAskInput['deliveryTarget'];
   questions: ReadonlyArray<AskQuestion>;
   customAnswers?: ReadonlyArray<string | null>;

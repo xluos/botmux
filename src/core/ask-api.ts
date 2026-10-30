@@ -28,6 +28,7 @@ export interface AskApiBody {
   /** Caller kind ('hook' | 'explicit' | …) namespacing the identity so an
    *  explicit `botmux ask` can't re-claim a hook ask's card. Optional. */
   originKind?: string;
+  groupMembersCanAnswer?: boolean;
   acknowledge?: boolean;
   asyncUserInput?: CodexAsyncUserInput;
   asyncFailure?: 'limit' | 'invalid_questions';
@@ -107,6 +108,8 @@ export function parseAskBody(raw: unknown): AskApiBody | { error: AskApiBodyErro
     originKind = r.originKind;
   }
 
+  if (r.groupMembersCanAnswer !== undefined && (typeof r.groupMembersCanAnswer !== 'boolean' || originKind !== 'explicit')) return { error: 'unsupported_fields' };
+
   if (r.acknowledge !== undefined && typeof r.acknowledge !== 'boolean') return { error: 'bad_acknowledge' };
 
   if (r.asyncFailure !== undefined && (originKind !== CODEX_ASYNC_ASK_ORIGIN
@@ -151,6 +154,7 @@ export function parseAskBody(raw: unknown): AskApiBody | { error: AskApiBodyErro
     rootMessageId: r.rootMessageId as string | null,
     questions,
     timeoutMs: r.timeoutMs,
+    ...(r.groupMembersCanAnswer !== undefined ? { groupMembersCanAnswer: r.groupMembersCanAnswer as boolean } : {}),
     ...(requestId !== undefined ? { requestId } : {}),
     ...(originKind !== undefined ? { originKind } : {}),
     ...(r.acknowledge !== undefined ? { acknowledge: r.acknowledge as boolean } : {}),

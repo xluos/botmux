@@ -1974,6 +1974,7 @@ export const messages: Record<string, string> = {
   'card.ask.invalidated_claimant_gone': '提问的会话已不在等这个回答（CLI 已退出、重启或这一轮已结束），这张卡不再接收回答。需要继续的话直接在会话里发消息。',
   'card.ask.invalidated_answer_undelivered': '这个回答没有送进会话：提问的 CLI 已不在等待。需要继续的话直接在会话里发消息。',
   'card.ask.answerable_designated_member': '指定成员（仅本人可操作）',
+  'card.ask.answerable_group_members': '本群成员',
   'card.ask.answerable_talk_members': '本群可对话成员',
 
   // Voice summary instruction (injected into the model session)
