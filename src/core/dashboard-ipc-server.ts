@@ -126,7 +126,7 @@ import {
   CURRENT_EXECUTION_IDENTITY_ROUTE,
   CURRENT_EXECUTION_IDENTITY_SCHEMA,
 } from '../cli/current-execution.js';
-import { resolveDaemonCurrentExecution } from './current-execution.js';
+import { resolveDaemonCurrentExecution, inspectDaemonCurrentExecution, ExecutionDiagnosticCache } from './current-execution.js';
 import {
   attestCurrentExecutionLoopbackPeer,
   currentTurnPeerAttestationStable,
@@ -1450,6 +1450,8 @@ ipcRoute('POST', MANAGED_ORIGIN_ATTEST_ROUTE, async (req, res) => {
 
 // Like current-actor, even a host-signed request must prove the live socket peer.
 // This route does not resolve a human identity or grant an action permission.
+const executionDiagnosticCache = new ExecutionDiagnosticCache();
+
 ipcRoute('POST', CURRENT_EXECUTION_ROUTE, async (req, res) => {
   const blocked = { schema: CURRENT_EXECUTION_SCHEMA, status: 'blocked', error: 'current_execution_unverified' };
   let body: unknown;
@@ -1466,9 +1468,19 @@ ipcRoute('POST', CURRENT_EXECUTION_ROUTE, async (req, res) => {
   const peer = resolveLoopbackPeerProcesses({
     remoteAddress: req.socket.remoteAddress, remotePort: req.socket.remotePort, localPort: req.socket.localPort,
   });
-  if (!peer.ok) return jsonRes(res, 403, blocked);
-  const document = resolveDaemonCurrentExecution({ sessionId, peer: peer.peer, findSession: findActiveBySessionId });
+  const { document, diagnostic } = inspectDaemonCurrentExecution({ sessionId, peer, findSession: findActiveBySessionId });
+  if (diagnostic.live?.larkAppId === cachedLarkAppId) executionDiagnosticCache.set(diagnostic);
   return document ? jsonRes(res, 200, document) : jsonRes(res, 403, blocked);
+});
+
+// Host-authenticated only: intentionally absent from all public allowlists.
+// This returns the last actual request observation, never an action capability.
+ipcRoute('GET', '/api/sessions/:sessionId/execution-attestation', (_req, res, params) => {
+  const ds = findActiveBySessionId(params.sessionId);
+  if (!cachedLarkAppId || ds?.larkAppId !== cachedLarkAppId) return jsonRes(res, 404, { ok: false, error: 'session_not_found' });
+  const diagnostic = executionDiagnosticCache.get(params.sessionId);
+  return diagnostic ? jsonRes(res, 200, { ok: true, diagnostic })
+    : jsonRes(res, 404, { ok: false, error: 'diagnostic_unavailable' });
 });
 
 /** Storage model the daemon publishes for a managed session is resolved with

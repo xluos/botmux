@@ -160,29 +160,35 @@ function peerBelongsToCurrentTurn(input: {
   trustedRootPids: ReadonlySet<number>;
   procRoot: string;
   preexistingProcessIdentities: ReadonlySet<string>;
+  onRejection?: (reason: string, ancestor?: ProcessIdentity) => void;
 }): boolean {
-  if (input.procRoot === '/proc' && process.platform !== 'linux') return false;
+  if (input.procRoot === '/proc' && process.platform !== 'linux') { input.onRejection?.('lineage_platform_unsupported'); return false; }
   let pid = input.peer.pid;
   for (let depth = 0; depth < 32 && pid > 1; depth++) {
     if (input.trustedRootPids.has(pid)) return true;
     try {
       const fields = procStatFieldsAfterComm(readFileSync(join(input.procRoot, String(pid), 'stat'), 'utf8'));
-      if (!fields) return false;
+      if (!fields) { input.onRejection?.('lineage_stat_unreadable'); return false; }
       const parent = Number(fields[1]);
       const started = fields[PROC_STAT_STARTTIME_INDEX];
-      if (!Number.isSafeInteger(parent) || !/^\d+$/.test(started ?? '')) return false;
+      if (!Number.isSafeInteger(parent) || !/^\d+$/.test(started ?? '')) { input.onRejection?.('lineage_stat_invalid'); return false; }
       if (input.preexistingProcessIdentities.has(`${pid}:${started}`)) {
         // Only traverse the native dispatcher as an ancestor of a new tool.
         // It cannot itself claim this turn, nor can old tool descendants.
         if (pid === input.peer.pid
           || !isNativeCodexToolHost(pid, parent, input.procRoot, input.trustedRootPids)
-          || readProcStart(pid, input.procRoot) !== started) return false;
+          || readProcStart(pid, input.procRoot) !== started) {
+          input.onRejection?.('preexisting_process', { pid, procStart: started });
+          return false;
+        }
       }
       pid = parent;
     } catch {
+      input.onRejection?.('lineage_stat_unreadable');
       return false;
     }
   }
+  input.onRejection?.('trusted_root_not_reached');
   return false;
 }
 
@@ -217,6 +223,8 @@ export interface CurrentTurnPeerAttestationInput {
   findSession: (sessionId: string) => DaemonSession | undefined;
   procRoot?: string;
   expectedScheduledTurnId?: string;
+  /** Internal diagnostics only. Never changes the proof or grants authority. */
+  onRejection?: (reason: string, ancestor?: ProcessIdentity) => void;
 }
 
 /**
@@ -247,30 +255,29 @@ export function attestCurrentExecutionLoopbackPeer(
   const scheduledCaller = input.expectedScheduledTurnId
     ? ds?.scheduledTurnCallers?.get(input.expectedScheduledTurnId)
     : undefined;
-  if (!ds || ds.session.status !== 'active'
-    || !larkTransportEnabled({ chatId: ds.chatId, apiOnly: ds.initConfig?.apiOnly })
-    || !turnId || generation === undefined
-    || !workerPid || !workerProcStart || ds.worker?.killed === true
-    || attestation?.workerGeneration !== generation
-    || ((cliPid === undefined) !== (cliProcStart === undefined))
-    || ((enginePid === undefined) !== (engineProcStart === undefined))
-    || (cliPid === undefined && enginePid === undefined)
-    || !processIdentities || processIdentities.length === 0
-    || !capability
-    || (dispatchAttempt !== undefined && (!Number.isSafeInteger(dispatchAttempt) || dispatchAttempt <= 0))
-    || (cliPid !== undefined
-      && readProcStart(cliPid, procRoot) !== cliProcStart)
-    || (enginePid !== undefined
-      && readProcStart(enginePid, procRoot) !== engineProcStart)) {
-    return null;
-  }
+  const reject = (reason: string): null => { input.onRejection?.(reason); return null; };
+  // Keep the original short-circuit order and predicates. Diagnostics are not
+  // an alternative attestation path and never repair missing proof material.
+  if (!ds) return reject('session_missing');
+  if (ds.session.status !== 'active') return reject('session_inactive');
+  if (!larkTransportEnabled({ chatId: ds.chatId, apiOnly: ds.initConfig?.apiOnly })) return reject('transport_disabled');
+  if (!turnId) return reject('turn_missing');
+  if (generation === undefined) return reject('generation_missing');
+  if (!workerPid || !workerProcStart || ds.worker?.killed === true) return reject('worker_unavailable');
+  if (attestation?.workerGeneration !== generation) return reject('attestation_generation_mismatch');
+  if ((cliPid === undefined) !== (cliProcStart === undefined)) return reject('cli_identity_incomplete');
+  if ((enginePid === undefined) !== (engineProcStart === undefined)) return reject('engine_identity_incomplete');
+  if (cliPid === undefined && enginePid === undefined) return reject('execution_roots_missing');
+  if (!processIdentities || processIdentities.length === 0) return reject('process_snapshot_missing');
+  if (!capability) return reject('capability_missing');
+  if (dispatchAttempt !== undefined && (!Number.isSafeInteger(dispatchAttempt) || dispatchAttempt <= 0)) return reject('dispatch_attempt_invalid');
+  if (cliPid !== undefined && readProcStart(cliPid, procRoot) !== cliProcStart) return reject('cli_start_mismatch');
+  if (enginePid !== undefined && readProcStart(enginePid, procRoot) !== engineProcStart) return reject('engine_start_mismatch');
   if (input.expectedScheduledTurnId
     && (!parseScheduledTurnId(input.expectedScheduledTurnId)
       || turnId !== input.expectedScheduledTurnId
       || !scheduledCaller
-      || scheduledCaller.requestUserOpenId !== callerOpenId)) {
-    return null;
-  }
+      || scheduledCaller.requestUserOpenId !== callerOpenId)) return reject('scheduled_turn_mismatch');
   const preexistingProcessIdentities = new Set(processIdentities);
   // The worker reports both roots over its private IPC channel. Binding each
   // PID to its proc start time prevents PID reuse, while the descendant walk
@@ -283,11 +290,9 @@ export function attestCurrentExecutionLoopbackPeer(
   ]);
   if (!peerBelongsToCurrentTurn({
       peer: input.peer, trustedRootPids, procRoot,
-      preexistingProcessIdentities,
-    })
-    || readProcStart(input.peer.pid, procRoot) !== input.peer.procStart) {
-    return null;
-  }
+      preexistingProcessIdentities, onRejection: input.onRejection,
+    })) return null;
+  if (readProcStart(input.peer.pid, procRoot) !== input.peer.procStart) return reject('peer_start_mismatch');
   return {
     ds, turnId, generation, callerOpenId, capability,
     ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
