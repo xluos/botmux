@@ -1733,6 +1733,40 @@ ipcRoute('GET', '/api/sessions', async (_req, res) => {
 
 // This route deliberately has NO session-capability/public allowlist entry.
 // Recycling multiple sessions requires the existing trusted-host HMAC.
+// Fleet maintenance likewise has no session-capability/relay allowlist entry.
+// Building this release supplies no grant or bootstrap. Until an independently
+// reviewed host adapter is installed, execution is explicitly unavailable.
+ipcRoute('POST', '/api/fleet-maintenance/:action', async (req, res, params) => {
+  if (!isTrustedHostIpcRequest(req)) return jsonRes(res, 403, { ok: false, error: 'trusted_host_required' });
+  if (!['prepare', 'read', 'abort', 'run', 'resume', 'reconcile', 'reconcile-drain', 'finish-release'].includes(params.action)) return jsonRes(res, 400, { ok: false, error: 'invalid_maintenance_action' });
+  const body = await readJsonBody<Record<string, unknown>>(req).catch(() => undefined);
+  if (!body || typeof body.operationId !== 'string') return jsonRes(res, 400, { ok: false, error: 'invalid_maintenance_request' });
+  const { FleetMaintenance, maintenanceDirectory, maintenanceDigest, readMaintenanceGrant, unavailableMaintenanceAdapter } = await import('./fleet-maintenance.js');
+  try {
+    const directory = maintenanceDirectory();
+    const grant = readMaintenanceGrant(directory, body.operationId);
+    if (grant.binding.appId !== cachedLarkAppId) return jsonRes(res, 403, { ok: false, error: 'maintenance_app_mismatch' });
+    const runtime = new FleetMaintenance(directory);
+    if (params.action === 'prepare') {
+      const state = runtime.prepare(body.plan, grant);
+      return jsonRes(res, 200, { ok: true, state, executionReady: false, reason: 'bootstrap_adapter_unavailable' });
+    }
+    // Match all task/work/execution/actor/App/session/Ask/audit fields rather
+    // than accepting the operator's operation id as authority on its own.
+    if (maintenanceDigest(body.binding) !== maintenanceDigest(grant.binding)) return jsonRes(res, 403, { ok: false, error: 'maintenance_binding_mismatch' });
+    const adapter = unavailableMaintenanceAdapter();
+    const state = params.action === 'run' ? await runtime.run(grant.binding, body.operationId, adapter)
+      : params.action === 'resume' ? await runtime.resume(grant.binding, body.operationId, adapter)
+      : params.action === 'reconcile' ? await runtime.reconcile(grant.binding, body.operationId, adapter)
+      : params.action === 'reconcile-drain' ? await runtime.reconcileDrain(grant.binding, body.operationId, adapter)
+      : params.action === 'finish-release' ? await runtime.finishRelease(grant.binding, body.operationId, adapter)
+      : params.action === 'abort' ? await runtime.abort(grant.binding, body.operationId) : runtime.read(grant.binding, body.operationId);
+    return jsonRes(res, 200, { ok: true, state });
+  } catch (error) {
+    return jsonRes(res, 409, { ok: false, error: error instanceof Error ? error.message : 'maintenance_unavailable' });
+  }
+});
+
 const workspaceRecycleRuntime = new WorkspaceRecycleRuntime({
   appId: () => cachedLarkAppId,
   dataDir: () => config.session.dataDir,

@@ -5,6 +5,7 @@
  * intervening awaits in inbound/HTTP turn preparation.
  */
 import { AsyncLocalStorage } from 'node:async_hooks';
+import { assertFleetMaintenanceAdmission } from './fleet-maintenance.js';
 
 type GateState = {
   activeAdmissions: number;
@@ -184,10 +185,12 @@ export async function withBotTurnAdmission<T>(
   // awaited would make the handler wait on itself and deadlock the drain.
   const inheritedLease = inherited?.get(larkAppId);
   if (inheritedLease?.active) return action();
+  assertFleetMaintenanceAdmission(larkAppId);
   const state = stateFor(larkAppId);
   // A mutation may finish and another queued mutation may close the gate again
   // before this continuation runs, so re-check after every wake.
   while (state.mutating) await waitUntilOpen(state);
+  assertFleetMaintenanceAdmission(larkAppId);
   state.activeAdmissions++;
   const lease: AdmissionLease = {
     active: true,
@@ -245,6 +248,7 @@ async function runBotTurnMutation<T>(
   await waitUntilDrained(state);
   const mutationLease: MutationLease = { active: true };
   try {
+    assertFleetMaintenanceAdmission(larkAppId);
     const next = new Map(mutationContext.getStore() ?? []);
     next.set(larkAppId, mutationLease);
     return await mutationContext.run(next, action);
@@ -275,6 +279,7 @@ export async function withBotTurnMutation<T>(
 ): Promise<T> {
   const inheritedMutation = mutationContext.getStore()?.get(larkAppId);
   if (inheritedMutation?.active) return action();
+  assertFleetMaintenanceAdmission(larkAppId);
   const state = stateFor(larkAppId);
   const inheritedAdmission = admissionContext.getStore()?.get(larkAppId);
 
@@ -355,6 +360,7 @@ async function runBoundedBotTurnMutation<T>(
 
   const mutationLease: MutationLease = { active: true };
   try {
+    assertFleetMaintenanceAdmission(larkAppId);
     const next = new Map(mutationContext.getStore() ?? []);
     next.set(larkAppId, mutationLease);
     if (Date.now() >= deadlineMs) {
@@ -382,6 +388,7 @@ export async function tryWithBotTurnMutation<T>(
   if (inheritedMutation?.active) {
     return { acquired: true, value: await action() };
   }
+  assertFleetMaintenanceAdmission(larkAppId);
   const state = stateFor(larkAppId);
   const inheritedAdmission = admissionContext.getStore()?.get(larkAppId);
   const deadlineMs = Date.now() + Math.max(0, acquireTimeoutMs);
