@@ -62,6 +62,7 @@ import {
   setActiveSessionsRegistry,
 } from '../src/core/worker-pool.js';
 import * as sessionStore from '../src/services/session-store.js';
+import { runIdempotencyFailClose } from '../src/core/daemon-background-close.js';
 
 let dataDir: string;
 let previousDataDir: string;
@@ -154,6 +155,39 @@ afterEach(() => {
 });
 
 describe('remote runner explicit close', () => {
+  it('refuses an old exit cleanup after a new worker generation starts during recovery', async () => {
+    vi.useFakeTimers();
+    const { ds, worker } = createFixture(true);
+    const generation = ds.workerGeneration;
+    const guard = () => ds.workerGeneration === generation;
+    const logger = { error: vi.fn() };
+    try {
+      const recovering = runIdempotencyFailClose(ds.session.sessionId,
+        id => closeSession(id, { closeGuard: guard }), logger, () => false);
+      ds.workerGeneration = (generation ?? 0) + 1;
+      await vi.advanceTimersByTimeAsync(10_000);
+      await recovering;
+      expect(worker!.send).not.toHaveBeenCalled();
+      expect(sessionStore.getSession(ds.session.sessionId)?.status).toBe('active');
+      expect(logger.error).not.toHaveBeenCalledWith(expect.stringContaining('fail-closed session'));
+    } finally { vi.useRealTimers(); }
+  });
+
+  it.each([true, false])('rejects guarded result cleanup before remote cancellation (live=%s)', async live => {
+    const { ds, worker } = createFixture(live);
+    const wake = vi.fn(async () => true);
+    __testOnly_setRemoteRunnerExplicitCloseWake(wake);
+    await expect(closeSession(ds.session.sessionId, { closeGuard: () => true })).resolves.toMatchObject({
+      ok: false, error: 'close_guard_changed', retryable: false,
+    });
+    expect(sessionStore.getSession(ds.session.sessionId)?.status).toBe('active');
+    expect(wake).not.toHaveBeenCalled();
+    if (worker) {
+      expect(worker.send).not.toHaveBeenCalled();
+      expect(worker.kill).not.toHaveBeenCalled();
+    }
+  });
+
   it('uses prepare/commit before publishing a live remote session closed', async () => {
     const { ds, worker } = createFixture(true);
 

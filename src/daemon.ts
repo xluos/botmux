@@ -31847,14 +31847,36 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       outcome = 'write_failed';
     }
     if (outcome === 'write_failed') {
+      const originalTurnId = ds.currentTurnId;
+      const closeGuard = () => findActiveBySessionId(ds.session.sessionId) === ds
+        && ds.workerGeneration === exitingWorkerGeneration && ds.currentTurnId === originalTurnId
+        && ds.session.status !== 'closed';
       // Durable terminal could not be written. Close the session so its persisted
       // status becomes `closed` → trigger-result resolves `failed` (soft terminal),
       // and resolveIdempotencyHit sees a not-live session on retry. This is the
       // observable fail-closed path the round-8 finding requires.
       void runIdempotencyFailClose(
         ds.session.sessionId,
-        closeSessionForBackgroundCleanup,
+        async (sessionId, context) => {
+          const result = await closeSessionForBackgroundCleanup(sessionId, context, { closeGuard });
+          if (!result.ok && result.error === 'close_guard_changed') {
+            for (const [turnId, turn] of ds.idempotentAsyncTurns ?? []) {
+              const pending = ds.asyncTriggerResults?.get(turnId);
+              if (turn.workerGeneration !== exitingWorkerGeneration || pending?.status !== 'pending' || !pending.pendingFinal) continue;
+              pending.status = 'failed';
+              pending.content = pending.pendingFinal.content;
+              pending.failedAt = Date.now();
+              pending.errorCode = 'trigger_failed';
+              pending.terminalErrorCode = 'async_result_persistence_failed';
+            }
+          }
+          return result;
+        },
         logger,
+        [...ds.idempotentAsyncTurns?.entries() ?? []].some(([turnId, turn]) =>
+          turn.workerGeneration === exitingWorkerGeneration && ds.asyncTriggerResults?.get(turnId)?.pendingFinal)
+          ? () => convergeIdempotentAsyncTurnOnWorkerExit(ds, exitingWorkerGeneration) !== 'write_failed'
+          : undefined,
       );
     }
   };

@@ -9920,6 +9920,13 @@ export interface CloseResidual {
  */
 export type CloseSessionResult =
   | {
+      ok: false;
+      alreadyClosed: false;
+      error: 'close_guard_changed';
+      retryable: false;
+      taskId?: undefined;
+    }
+  | {
       ok: true;
       outcome: 'closed';
       alreadyClosed: boolean;
@@ -9953,7 +9960,7 @@ export type CloseSessionResult =
 export async function closeSessionForBackgroundCleanup(
   sessionId: string,
   context: string,
-  opts?: { backgroundExecutionCleanup?: boolean },
+  opts?: { backgroundExecutionCleanup?: boolean; closeGuard?: () => boolean },
 ): Promise<CloseSessionResult> {
   const result = await closeSession(sessionId, opts);
   const tagId = sessionId.slice(0, 8);
@@ -9979,8 +9986,11 @@ export async function closeSessionForBackgroundCleanup(
 
 export async function closeSession(
   sessionId: string,
-  opts?: { awaitWorkerExit?: boolean; workspaceRetirement?: Session['workspaceRetirement']; cardVisibility?: 'private' | 'public'; explicitClose?: boolean; backgroundExecutionCleanup?: boolean; onArchiveError?: (error: string) => Promise<unknown>; onCodexCleanupRelease?: (ticket: CodexCleanupReleaseTicket) => void },
+  opts?: { awaitWorkerExit?: boolean; workspaceRetirement?: Session['workspaceRetirement']; cardVisibility?: 'private' | 'public'; explicitClose?: boolean; backgroundExecutionCleanup?: boolean; closeGuard?: () => boolean; onArchiveError?: (error: string) => Promise<unknown>; onCodexCleanupRelease?: (ticket: CodexCleanupReleaseTicket) => void },
 ): Promise<CloseSessionResult> {
+  if (opts?.closeGuard && !opts.closeGuard()) {
+    return { ok: false, alreadyClosed: false, error: 'close_guard_changed', retryable: false };
+  }
   // `awaitWorkerExit` (default true): whether to block on the worker process
   // actually exiting before returning. A busy CLI wedges in node-pty teardown
   // and only dies at the ~7s SIGKILL backstop, so callers behind a tight ACK
@@ -9999,6 +10009,11 @@ export async function closeSession(
   const isOwnedRiffClose = isOwnedClose && closeFrozenBackendType === 'riff';
   const isOwnedMojoClose = isOwnedClose && closeFrozenBackendType === 'mojo';
   const isOwnedRemoteRunnerClose = isOwnedClose && closeFrozenBackendType === 'remote-runner';
+  // Result-storage cleanup may close its original local generation, but it
+  // cannot authorize a remote cancellation or wake a new control worker.
+  if (opts?.closeGuard && (isOwnedRiffClose || isOwnedMojoClose || isOwnedRemoteRunnerClose)) {
+    return { ok: false, alreadyClosed: false, error: 'close_guard_changed', retryable: false };
+  }
   const closeJournal = ds?.session.mojoCloseJournal ?? stored?.mojoCloseJournal;
   if (closeJournal && !isOwnedMojoClose) {
     // Never let a Mojo cancellation journal silently disappear through another
@@ -10096,6 +10111,9 @@ export async function closeSession(
         : { ok: true };
   if (!prepared.ok) {
     return { ...prepared, alreadyClosed: false };
+  }
+  if (opts?.closeGuard && !opts.closeGuard()) {
+    return { ok: false, alreadyClosed: false, error: 'close_guard_changed', retryable: false };
   }
   // Only when the cancel actually happened: a quarantined / bot-gone mojo session
   // keeps its lineage on the row for manual cleanup.
@@ -16044,7 +16062,9 @@ function setupWorkerHandlers(
     if (isSilentScheduledTurn(ds, turnId)) return true;
     // Loud triggers suppress model replies, not a redacted runtime failure.
     // Scheduled silence and managed/attempt ownership remain authoritative.
-    if (!terminalDiagnostic && isTriggerFinalSuppressed(ds, turnId)) return true;
+    const privateHttpSink = !ds.session.vcMeetingReceiver && !!turnId
+      && (ds.pendingWaitPromises?.has(turnId) || ds.asyncTriggerResults?.has(turnId));
+    if (!terminalDiagnostic && isTriggerFinalSuppressed(ds, turnId) && !privateHttpSink) return true;
     // Only a genuinely meeting-driven turn is subject to the durable meeting-send
     // policy; a plain user turn on this session posts through the ordinary path
     // (see isMeetingDrivenTurn).
@@ -19247,9 +19267,13 @@ function setupWorkerHandlers(
             || virtualDeliverySinkForChatId(ds.chatId) === 'http_async';
           if (asyncSink) {
             nonLarkFailureHandled = true;
-            rememberHttpTerminal(ds, msg.turnId);
+            const pendingFinalOwns = asyncResult?.pendingFinal && asyncResult.status !== 'interrupted'
+              && msg.status !== 'cancelled';
+            if (!pendingFinalOwns) rememberHttpTerminal(ds, msg.turnId);
             const failedAt = Date.now();
-            if (asyncResult?.status === 'completed') {
+            if (pendingFinalOwns) {
+              logger.info(`[${t}] Kept received async final pending durable storage`);
+            } else if (asyncResult?.status === 'completed') {
               // final_output is stronger and may have settled immediately before
               // the ordered terminal IPC. Never replace known output with a
               // later failure boundary, even if its best-effort durable write
@@ -19266,7 +19290,8 @@ function setupWorkerHandlers(
               // upgrade its generic code with this terminal's provider code.
               // Use the same snapshot for memory and disk; a virtual/headless
               // sink alone must not create a cancelled trigger out of nothing.
-              const interrupted = msg.status === 'cancelled' && asyncResult?.status === 'pending';
+              const interrupted = msg.status === 'cancelled' && (asyncResult?.status === 'pending'
+                || asyncResult?.pendingFinal && asyncResult.terminalErrorCode === 'async_result_persistence_failed');
               if (asyncResult?.status === 'pending' || asyncResult?.status === 'failed') {
                 if (interrupted) {
                   asyncResult.status = 'interrupted';
@@ -19388,20 +19413,10 @@ function setupWorkerHandlers(
           && !ds.session.vcMeetingReceiver) {
           const pendingAsync = ds.asyncTriggerResults?.get(msg.turnId);
           if (pendingAsync && pendingAsync.status === 'pending') {
-            const completedAt = Date.now();
-            pendingAsync.status = 'completed';
-            pendingAsync.content = '';
-            pendingAsync.completedAt = completedAt;
-            try {
-              asyncTriggerStore.recordCompleted(ds.session.sessionId, msg.turnId, '', completedAt, ds.larkAppId);
-            } catch (err: any) {
-              logger.error(`[${t}] Failed to persist async terminal-settle for ${msg.turnId.substring(0, 8)}: ${err.message}`);
-            }
-            // Cleared like the final_output path so worker-exit convergence does
-            // not retro-fail this now-completed turn. Per-triggerId delete so a
-            // concurrent sibling keyed turn's convergence entry is untouched.
-            ds.idempotentAsyncTurns?.delete(msg.turnId);
-            logger.info(`[${t}] Settled async HTTP turn ${msg.turnId.substring(0, 8)} completed (empty output; nothing-to-send)`);
+            deliverFinalOutputWithShutdownDrain(ds, {
+              type: 'final_output', sessionId: ds.session.sessionId, turnId: msg.turnId,
+              lastUuid: msg.turnId, content: '',
+            }, t, ownsLifecycleMutation);
           }
         }
         // Resolve the terminal-strip route once and share it with the legacy
@@ -21195,6 +21210,16 @@ function deliverFinalOutput(
     onComplete?.(false);
     return;
   }
+  const originalHttpWaiter = !ds.session.vcMeetingReceiver && ds.pendingWaitPromises?.get(msg.turnId);
+  const originalHttpResult = !ds.session.vcMeetingReceiver && ds.asyncTriggerResults?.get(msg.turnId);
+  if (originalHttpWaiter || originalHttpResult) {
+    const ownsTurn = isStillOwned;
+    // A timed-out or already-consumed HTTP sink never becomes a chat reply.
+    // Keep its exact identity across LinkRef and delivery retry callbacks.
+    isStillOwned = () => ownsTurn() && (originalHttpWaiter
+      ? ds.pendingWaitPromises?.get(msg.turnId) === originalHttpWaiter
+      : ds.asyncTriggerResults?.get(msg.turnId) === originalHttpResult);
+  }
   const unresolvedMsg = msg;
   const linkRefKey = {
     appId: ds.larkAppId,
@@ -21280,6 +21305,10 @@ function deliverFinalOutput(
     const failureCode = msg.turnFailureCode || 'worker_turn_failed';
     const failedWait = ds.pendingWaitPromises?.get(msg.turnId);
     const failedAsync = ds.asyncTriggerResults?.get(msg.turnId);
+    if (failedAsync?.pendingFinal && failedAsync.status !== 'interrupted') {
+      onComplete?.(true);
+      return;
+    }
     if (failedAsync?.status === 'completed' || failedAsync?.status === 'interrupted') {
       rememberHttpTerminal(ds, msg.turnId);
       onComplete?.(true);
@@ -21368,14 +21397,43 @@ function deliverFinalOutput(
       return;
     }
     const completedAt = Date.now();
+    // Persist before publishing completion or releasing the original ownership.
+    asyncResult.pendingFinal ??= { content: msg.content, receivedAt: completedAt,
+      ...(msg.usage ? { usage: msg.usage } : {}) };
+    msg = { ...msg, content: asyncResult.pendingFinal.content, usage: asyncResult.pendingFinal.usage };
+    try {
+      const outcome = asyncTriggerStore.recordCompleted(
+        ds.session.sessionId, msg.turnId, msg.content, completedAt, ds.larkAppId, msg.usage, 'durable',
+      );
+      if (outcome === 'already_completed' || outcome === 'already_terminal') {
+        ds.asyncTriggerResults?.delete(msg.turnId);
+        ds.idempotentAsyncTurns?.delete(msg.turnId);
+        onComplete?.(true);
+        return;
+      }
+    } catch (error) {
+      const next = attempt + 1;
+      if (next >= FINAL_OUTPUT_RETRY_BACKOFF_MS.length) {
+        asyncResult.status = 'failed';
+        asyncResult.content = msg.content;
+        asyncResult.failedAt = completedAt;
+        asyncResult.errorCode = 'trigger_failed';
+        asyncResult.terminalErrorCode = 'async_result_persistence_failed';
+        logger.error(`[${t}] Async final persistence exhausted for ${msg.turnId.substring(0, 8)}`);
+        onComplete?.(false);
+        return;
+      }
+      logger.warn(`[${t}] Async final persistence failed; retrying original turn`);
+      setTimeout(() => deliverFinalOutput(
+        ds, msg, t, next, onComplete, isStillOwned, frozenReplyTarget, renderSnapshot, initiator, imageFallback,
+      ), FINAL_OUTPUT_RETRY_BACKOFF_MS[next] ?? 0);
+      return;
+    }
     asyncResult.status = 'completed';
     asyncResult.content = msg.content;
     asyncResult.completedAt = completedAt;
     if (msg.usage) asyncResult.usage = msg.usage;
-    // Durably persist the outcome so trigger-result can rebuild `completed`
-    // (with content + usage) after a daemon restart drops the in-memory Map.
-    // Stamp the owning bot for cross-bot isolation.
-    asyncTriggerStore.recordCompleted(ds.session.sessionId, msg.turnId, msg.content, completedAt, ds.larkAppId, msg.usage);
+    delete asyncResult.pendingFinal;
     // This idempotent async turn produced its terminal output — drop its
     // worker-exit convergence entry so a later graceful exit of this generation
     // is not retro-failed (codex #776 round-6 finding #1). Per-triggerId delete so

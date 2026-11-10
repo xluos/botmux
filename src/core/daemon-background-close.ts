@@ -22,7 +22,18 @@ export async function runIdempotencyFailClose(
   sessionId: string,
   close: BackgroundClose,
   logger: Pick<BackgroundCloseLogger, 'error'>,
+  recoverReceivedFinal?: () => boolean | Promise<boolean>,
 ): Promise<void> {
+  if (recoverReceivedFinal) {
+    for (const delayMs of [1000, 5000]) {
+      await new Promise<void>(resolve => setTimeout(resolve, delayMs));
+      try {
+        if (await recoverReceivedFinal()) return;
+      } catch (error) {
+        logger.error(`[idempotency] received-final recovery failed for ${sessionId.slice(0, 8)}`);
+      }
+    }
+  }
   try {
     const result = await close(sessionId, IDEMPOTENCY_FAIL_CLOSE_CONTEXT);
     if (!result.ok) return;

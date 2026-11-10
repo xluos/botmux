@@ -12,6 +12,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { mkdtempSync, rmSync, existsSync, writeFileSync, mkdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
+import * as atomic from '../src/utils/atomic-write.js';
 
 let tempDir: string;
 
@@ -79,6 +80,19 @@ describe('recordPending + lookup', () => {
 });
 
 describe('recordCompleted', () => {
+  it('durable completion rejects failed writes and preserves the original result across retries', () => {
+    recordPending('strict-session', 'original', 1000, 'cli_test');
+    const write = vi.spyOn(atomic, 'atomicWriteFileSync').mockImplementationOnce(() => { throw Error('EIO'); });
+    try {
+      expect(() => recordCompleted('strict-session', 'original', 'actual result', 2000, 'cli_test', undefined, 'durable')).toThrow('EIO');
+      expect(lookupStrict('strict-session', 'original')?.result.status).toBe('pending');
+      expect(recordCompleted('strict-session', 'original', 'actual result', 2000, 'cli_test', undefined, 'durable')).toBe('written_completed');
+      expect(recordCompleted('strict-session', 'original', 'different result', 3000, 'cli_test', undefined, 'durable')).toBe('already_completed');
+      expect(lookupStrict('strict-session', 'original')?.result).toMatchObject({ status: 'completed', content: 'actual result', completedAt: 2000 });
+      expect(() => recordCompleted('strict-session', 'original', 'foreign', 4000, 'other-bot', undefined, 'durable')).toThrow('owner mismatch');
+    } finally { write.mockRestore(); }
+  });
+
   it('marks a previously-pending trigger completed with content', () => {
     recordPending('sess1', 'trg_a', 1000, 'cli_test');
     recordCompleted('sess1', 'trg_a', 'BOTMUX_RUN_OK', 5000, 'cli_test');

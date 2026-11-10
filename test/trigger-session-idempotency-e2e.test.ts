@@ -92,6 +92,8 @@ vi.mock('../src/core/worker-pool.js', () => ({
 import { triggerSessionTurn, convergeIdempotentAsyncTurnOnWorkerExit, buildExternalEventDataContext } from '../src/core/trigger-session.js';
 import * as asyncTriggerStore from '../src/services/async-trigger-store.js';
 import * as idempotencyStore from '../src/services/idempotency-store.js';
+import * as atomic from '../src/utils/atomic-write.js';
+import { runIdempotencyFailClose } from '../src/core/daemon-background-close.js';
 import { acquireDeviceIsolationFreeze, releaseDeviceIsolationFreeze, resetDeviceIsolationActivationForTest } from '../src/core/device-isolation-activation.js';
 
 const APP = 'local_riff';
@@ -298,12 +300,101 @@ describe('triggerSessionTurn — idempotency dispatch (real stores)', () => {
     expect(mockForkWorker).toHaveBeenCalledTimes(1); // still ONE fork
   });
 
+  it('persists a received final on worker exit after the first write failed, without a second dispatch', async () => {
+    const shared = new Map(), request = freshAsyncReq('received-final-exit');
+    const first = await triggerSessionTurn(request, { larkAppId: APP, activeSessions: shared });
+    const sid = first.target!.sessionId!, turnId = first.triggerId!;
+    const ds = [...shared.values()].find((d: any) => d.session.sessionId === sid) as any;
+    const gen = ds.idempotentAsyncTurns.get(turnId).workerGeneration;
+    ds.asyncTriggerResults.get(turnId).pendingFinal = { content: 'confirmed final', receivedAt: Date.now() };
+    const write = vi.spyOn(atomic, 'atomicWriteFileSync').mockImplementationOnce(() => { throw Error('EIO'); });
+    try {
+      expect(() => asyncTriggerStore.recordCompleted(sid, turnId, 'confirmed final', Date.now(), APP, undefined, 'durable')).toThrow('EIO');
+      ds.worker = null;
+      expect(convergeIdempotentAsyncTurnOnWorkerExit(ds, gen)).toBe('converged');
+    } finally { write.mockRestore(); }
+    expect(asyncTriggerStore.lookupStrict(sid, turnId)?.result).toMatchObject({ status: 'completed', content: 'confirmed final' });
+    expect(ds.asyncTriggerResults.get(turnId)).toMatchObject({ status: 'completed', content: 'confirmed final' });
+    expect(ds.idempotentAsyncTurns.has(turnId)).toBe(false);
+    const retry = await triggerSessionTurn(request, { larkAppId: APP, activeSessions: shared });
+    expect(retry.idempotent).toBe(true);
+    expect(retry.target?.sessionId).toBe(sid);
+    expect(retry.triggerId).toBe(turnId);
+    expect(mockForkWorker).toHaveBeenCalledTimes(1);
+  });
+
+  it('retains a received final and its ownership when exit persistence also fails, then recovers once', async () => {
+    const shared = new Map();
+    const first = await triggerSessionTurn(freshAsyncReq('received-final-write-failed'), { larkAppId: APP, activeSessions: shared });
+    const sid = first.target!.sessionId!, turnId = first.triggerId!;
+    const ds = [...shared.values()].find((d: any) => d.session.sessionId === sid) as any;
+    const gen = ds.idempotentAsyncTurns.get(turnId).workerGeneration;
+    ds.asyncTriggerResults.get(turnId).pendingFinal = { content: 'retained final', receivedAt: Date.now() };
+    const write = vi.spyOn(atomic, 'atomicWriteFileSync').mockImplementationOnce(() => { throw Error('EIO'); });
+    try {
+      ds.worker = null;
+      expect(convergeIdempotentAsyncTurnOnWorkerExit(ds, gen)).toBe('write_failed');
+    } finally { write.mockRestore(); }
+    expect(ds.asyncTriggerResults.get(turnId).pendingFinal.content).toBe('retained final');
+    expect(ds.idempotentAsyncTurns.has(turnId)).toBe(true);
+    expect(asyncTriggerStore.lookupStrict(sid, turnId)?.result.status).toBe('pending');
+    expect(convergeIdempotentAsyncTurnOnWorkerExit(ds, gen)).toBe('converged');
+    expect(asyncTriggerStore.lookupStrict(sid, turnId)?.result.content).toBe('retained final');
+    expect(convergeIdempotentAsyncTurnOnWorkerExit(ds, gen)).toBe('noop');
+  });
+
+  it.each(['recovered', 'cancelled', 'unavailable'])('runs production exit recovery before close when persistence is %s', async state => {
+    vi.useFakeTimers();
+    const shared = new Map();
+    const first = await triggerSessionTurn(freshAsyncReq('production-received-final'), { larkAppId: APP, activeSessions: shared });
+    const sid = first.target!.sessionId!, turnId = first.triggerId!;
+    const ds = [...shared.values()].find((d: any) => d.session.sessionId === sid) as any;
+    const gen = ds.idempotentAsyncTurns.get(turnId).workerGeneration;
+    ds.asyncTriggerResults.get(turnId).pendingFinal = { content: 'production final', receivedAt: Date.now() };
+    const close = vi.fn(async () => ({ ok: true, outcome: 'closed', alreadyClosed: false, known: true } as const));
+    const logger = { error: vi.fn() };
+    const write = vi.spyOn(atomic, 'atomicWriteFileSync');
+    if (state === 'unavailable') write.mockImplementation(() => { throw Error('EIO'); });
+    else write.mockImplementationOnce(() => { throw Error('EIO'); });
+    try {
+      ds.worker = null;
+      expect(convergeIdempotentAsyncTurnOnWorkerExit(ds, gen)).toBe('write_failed');
+      const recovering = runIdempotencyFailClose(sid, close, logger,
+        () => convergeIdempotentAsyncTurnOnWorkerExit(ds, gen) !== 'write_failed');
+      expect(close).not.toHaveBeenCalled();
+      if (state === 'cancelled') {
+        asyncTriggerStore.recordInterruptedStrict(sid, turnId, Date.now(), APP);
+        ds.asyncTriggerResults.get(turnId).status = 'interrupted';
+      }
+      await vi.advanceTimersByTimeAsync(10_000);
+      await recovering;
+      expect(close).toHaveBeenCalledTimes(state === 'unavailable' ? 1 : 0);
+      expect(asyncTriggerStore.lookupStrict(sid, turnId)?.result.status).toBe(
+        state === 'unavailable' ? 'pending' : state === 'cancelled' ? 'interrupted' : 'completed');
+    } finally { write.mockRestore(); vi.useRealTimers(); }
+  });
+
+  it('keeps an acknowledged cancellation terminal even with a received final on worker exit', async () => {
+    const shared = new Map();
+    const first = await triggerSessionTurn(freshAsyncReq('received-final-cancel'), { larkAppId: APP, activeSessions: shared });
+    const sid = first.target!.sessionId!, turnId = first.triggerId!;
+    const ds = [...shared.values()].find((d: any) => d.session.sessionId === sid) as any;
+    const gen = ds.idempotentAsyncTurns.get(turnId).workerGeneration;
+    ds.asyncTriggerResults.get(turnId).pendingFinal = { content: 'cancelled final', receivedAt: Date.now() };
+    asyncTriggerStore.recordInterruptedStrict(sid, turnId, Date.now(), APP);
+    ds.asyncTriggerResults.get(turnId).status = 'interrupted';
+    ds.worker = null;
+    expect(convergeIdempotentAsyncTurnOnWorkerExit(ds, gen)).toBe('converged');
+    expect(asyncTriggerStore.lookupStrict(sid, turnId)?.result.status).toBe('interrupted');
+  });
+
   it('worker-exit convergence ignores a NON-matching generation (no retro-fail of a later turn)', async () => {
     const shared = new Map();
     const first = await triggerSessionTurn(freshAsyncReq('k-wxgen'), { larkAppId: APP, activeSessions: shared });
     const sid = first.target!.sessionId!;
     const ds = [...shared.values()].find((d: any) => d.session.sessionId === sid) as any;
     const gen = ds.idempotentAsyncTurns.get(first.triggerId!).workerGeneration;
+    ds.asyncTriggerResults.get(first.triggerId!).pendingFinal = { content: 'current generation', receivedAt: Date.now() };
     // A DIFFERENT (older) generation exits → must NOT converge this turn.
     convergeIdempotentAsyncTurnOnWorkerExit(ds, gen - 1);
     expect(asyncTriggerStore.lookup(sid, first.triggerId!)?.result.status).toBe('pending'); // untouched

@@ -99,6 +99,8 @@ import { initWorkerPool, interruptExactWorkerTurn, __testOnly_setupWorkerHandler
 import type { DaemonSession } from '../src/core/types.js';
 import type { WorkerToDaemon } from '../src/types.js';
 import { EventEmitter } from 'node:events';
+import { armTriggerFinalSuppression } from '../src/core/trigger-final-suppression.js';
+import { setLinkRefRuntime } from '../src/services/link-ref-runtime.js';
 
 function makeDs(): DaemonSession {
   const fakeWorker = new EventEmitter() as any;
@@ -179,7 +181,7 @@ function terminalMsg(
 
 describe('async-HTTP settle-on-terminal (daemon turn_terminal handler)', () => {
   beforeEach(() => {
-    recordCompletedMock.mockClear();
+    recordCompletedMock.mockReset().mockReturnValue('written_completed');
     recordTerminalFailureStrictMock.mockClear();
     recordTerminalFailureStrictMock.mockReturnValue('written_failed');
     initWorkerPool({
@@ -189,7 +191,139 @@ describe('async-HTTP settle-on-terminal (daemon turn_terminal handler)', () => {
       closeSession: vi.fn(),
     } as any);
   });
-  afterEach(() => { vi.clearAllMocks(); });
+  afterEach(() => { setLinkRefRuntime(undefined); vi.useRealTimers(); vi.clearAllMocks(); });
+
+  it.each(['codex', 'claude-code', 'traex'])('captures a suppressed %s HTTP final without sending it to chat', async cliId => {
+    const ds = makeDs(); ds.session.cliId = cliId;
+    ds.asyncTriggerResults = new Map([['suppressed-http', { status: 'pending' } as any]]);
+    ds.idempotentAsyncTurns = new Map([['suppressed-http', { workerGeneration: 1 } as any]]);
+    armTriggerFinalSuppression(ds, 'suppressed-http');
+    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+    (ds.worker as any).emit('message', {
+      type: 'final_output', sessionId: ds.session.sessionId, turnId: 'suppressed-http',
+      lastUuid: 'suppressed-http', content: 'actual final checkpoint',
+    });
+    await vi.waitFor(() => expect(ds.asyncTriggerResults!.get('suppressed-http')).toMatchObject({
+      status: 'completed', content: 'actual final checkpoint',
+    }));
+    expect(recordCompletedMock).toHaveBeenCalledWith(
+      ds.session.sessionId, 'suppressed-http', 'actual final checkpoint', expect.any(Number), 'app_test', undefined, 'durable',
+    );
+    expect(ds.idempotentAsyncTurns.has('suppressed-http')).toBe(false);
+    expect(sessionReplyMock).not.toHaveBeenCalled();
+  });
+
+  it('resolves a suppressed wait-mode final through its original HTTP waiter', async () => {
+    const ds = makeDs(), resolve = vi.fn();
+    ds.pendingWaitPromises = new Map([['suppressed-wait', { resolve }]]);
+    armTriggerFinalSuppression(ds, 'suppressed-wait');
+    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+    (ds.worker as any).emit('message', {
+      type: 'final_output', sessionId: ds.session.sessionId, turnId: 'suppressed-wait',
+      lastUuid: 'suppressed-wait', content: 'actual wait result',
+    });
+    await vi.waitFor(() => expect(resolve).toHaveBeenCalledWith('actual wait result'));
+    expect(sessionReplyMock).not.toHaveBeenCalled();
+  });
+
+  it.each(['unmatched', 'foreign-session', 'meeting-receiver'])('retains suppression and ownership for %s output', async scenario => {
+    const ds = makeDs();
+    ds.asyncTriggerResults = new Map([['accepted-http', { status: 'pending' } as any]]);
+    const turnId = scenario === 'unmatched' ? 'other-turn' : 'accepted-http';
+    if (scenario === 'meeting-receiver') ds.session.vcMeetingReceiver = {} as any;
+    armTriggerFinalSuppression(ds, turnId);
+    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+    (ds.worker as any).emit('message', {
+      type: 'final_output', sessionId: scenario === 'foreign-session' ? 'foreign' : ds.session.sessionId,
+      turnId, lastUuid: turnId, content: 'must remain private',
+    });
+    await new Promise<void>(resolve => setImmediate(resolve));
+    expect(ds.asyncTriggerResults.get('accepted-http')?.status).toBe('pending');
+    expect(recordCompletedMock).not.toHaveBeenCalled();
+    expect(sessionReplyMock).not.toHaveBeenCalled();
+  });
+
+  it.each(['wait-timeout', 'async-cleared', 'duplicate-wait'])('keeps the original HTTP sink private across %s retries', async scenario => {
+    vi.useFakeTimers();
+    const ds = makeDs(), turnId = 'private-retry';
+    const resolve = vi.fn(() => ds.pendingWaitPromises!.delete(turnId));
+    if (scenario === 'async-cleared') ds.asyncTriggerResults = new Map([[turnId, { status: 'pending' } as any]]);
+    else ds.pendingWaitPromises = new Map([[turnId, { resolve }]]);
+    armTriggerFinalSuppression(ds, turnId);
+    let calls = 0;
+    const failures = scenario === 'duplicate-wait' ? 2 : 1;
+    setLinkRefRuntime({ prepareFinalDraft: ({ content }: { content: string }) => {
+      if (++calls <= failures) throw Error('temporary preparation failure');
+      return { content, draftPending: false };
+    } } as any);
+    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+    const msg = { type: 'final_output', sessionId: ds.session.sessionId, turnId,
+      lastUuid: turnId, content: 'private result', linkRefMode: 'enabled' };
+    (ds.worker as any).emit('message', msg);
+    if (scenario === 'duplicate-wait') (ds.worker as any).emit('message', msg);
+    else { ds.pendingWaitPromises?.delete(turnId); ds.asyncTriggerResults?.delete(turnId); }
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(resolve).toHaveBeenCalledTimes(scenario === 'duplicate-wait' ? 1 : 0);
+    expect(recordCompletedMock).not.toHaveBeenCalled();
+    expect(sessionReplyMock).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['final', false], ['final', true], ['silent', false], ['silent', true],
+  ] as const)('retains pending %s ownership until durable persistence succeeds (permanent=%s)', async (kind, permanent) => {
+    vi.useFakeTimers();
+    const ds = makeDs(), turnId = 'persist-original';
+    ds.asyncTriggerResults = new Map([[turnId, { status: 'pending' } as any]]);
+    ds.idempotentAsyncTurns = new Map([[turnId, { workerGeneration: 1 } as any]]);
+    armTriggerFinalSuppression(ds, turnId);
+    if (permanent) recordCompletedMock.mockImplementation(() => { throw Error('EIO'); });
+    else recordCompletedMock.mockImplementationOnce(() => { throw Error('EIO'); });
+    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+    const content = kind === 'silent' ? '' : 'original result';
+    (ds.worker as any).emit('message', kind === 'silent'
+      ? terminalMsg(turnId, { outputDisposition: 'nothing_to_send' })
+      : { type: 'final_output', sessionId: ds.session.sessionId, turnId, lastUuid: turnId, content });
+    expect(ds.asyncTriggerResults.get(turnId)?.status).toBe('pending');
+    expect(ds.idempotentAsyncTurns.has(turnId)).toBe(true);
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(ds.asyncTriggerResults.get(turnId)).toMatchObject(permanent
+      ? { status: 'failed', content, terminalErrorCode: 'async_result_persistence_failed' }
+      : { status: 'completed', content });
+    expect(ds.idempotentAsyncTurns.has(turnId)).toBe(permanent);
+    expect(recordCompletedMock.mock.calls.length).toBeGreaterThan(1);
+    expect(sessionReplyMock).not.toHaveBeenCalled();
+    if (permanent) {
+      (ds.worker as any).emit('message', terminalMsg(turnId, { status: 'failed', errorCode: 'provider_unexpected_eof' }));
+      await vi.advanceTimersByTimeAsync(0);
+      expect(ds.asyncTriggerResults.get(turnId)?.terminalErrorCode).toBe('async_result_persistence_failed');
+      (ds.worker as any).emit('message', terminalMsg(turnId, { status: 'cancelled', errorCode: 'cancelled' }));
+      await vi.advanceTimersByTimeAsync(0);
+      expect(ds.asyncTriggerResults.get(turnId)?.status).toBe('interrupted');
+    }
+  });
+
+  it.each(['failed-terminal', 'failed-fallback', 'cancelled-terminal'])('keeps received final priority across %s during persistence retry', async boundary => {
+    vi.useFakeTimers();
+    const ds = makeDs(), turnId = 'final-before-terminal';
+    ds.asyncTriggerResults = new Map([[turnId, { status: 'pending' } as any]]);
+    ds.idempotentAsyncTurns = new Map([[turnId, { workerGeneration: 1 } as any]]);
+    armTriggerFinalSuppression(ds, turnId);
+    recordCompletedMock.mockImplementationOnce(() => { throw Error('EIO'); });
+    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+    (ds.worker as any).emit('message', {
+      type: 'final_output', sessionId: ds.session.sessionId, turnId, lastUuid: turnId, content: 'confirmed final',
+    });
+    expect(ds.asyncTriggerResults.get(turnId)?.pendingFinal?.content).toBe('confirmed final');
+    (ds.worker as any).emit('message', boundary === 'failed-fallback'
+      ? { type: 'final_output', sessionId: ds.session.sessionId, turnId, lastUuid: 'fallback',
+          content: 'later diagnostic', turnFailed: true, turnFailureCode: 'provider_unexpected_eof' }
+      : terminalMsg(turnId, { status: boundary === 'cancelled-terminal' ? 'cancelled' : 'failed',
+          errorCode: boundary === 'cancelled-terminal' ? 'cancelled' : 'provider_unexpected_eof' }));
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(ds.asyncTriggerResults.get(turnId)).toMatchObject(boundary === 'cancelled-terminal'
+      ? { status: 'interrupted' } : { status: 'completed', content: 'confirmed final' });
+    expect(sessionReplyMock).not.toHaveBeenCalled();
+  });
 
   it('settles a native cancellation as interrupted without fabricating completed output', async () => {
     const ds = makeDs();
@@ -221,7 +355,7 @@ describe('async-HTTP settle-on-terminal (daemon turn_terminal handler)', () => {
     });
     // Durable persistence with EMPTY content.
     expect(recordCompletedMock).toHaveBeenCalledWith(
-      'sid-async-settle', 'turn-silent', '', expect.any(Number), 'app_test',
+      'sid-async-settle', 'turn-silent', '', expect.any(Number), 'app_test', undefined, 'durable',
     );
     // Worker-exit convergence entry dropped (by triggerId) so a later graceful exit can't retro-fail it.
     expect(ds.idempotentAsyncTurns!.get('turn-silent')).toBeUndefined();
@@ -247,6 +381,7 @@ describe('async-HTTP settle-on-terminal (daemon turn_terminal handler)', () => {
   it.each(['codex', 'traex', 'claude-code'])('settles %s failed fallback as failure, never completed text', async cliId => {
     const ds = makeDs(); ds.session.cliId = cliId;
     ds.asyncTriggerResults = new Map([['failure', { status: 'pending' } as any]]);
+    armTriggerFinalSuppression(ds, 'failure');
     __testOnly_setupWorkerHandlers(ds, ds.worker as any);
     (ds.worker as any).emit('message', {
       type: 'final_output', sessionId: ds.session.sessionId, turnId: 'failure', lastUuid: 'failure',

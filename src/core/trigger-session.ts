@@ -625,6 +625,25 @@ export function convergeIdempotentAsyncTurnOnWorkerExit(
       && existing.ownerLarkAppId === turn.ownerLarkAppId;
     if (ownedCompleted) { turns.delete(triggerId); convergedAny = true; continue; }
     try {
+      const liveResult = ds.asyncTriggerResults?.get(triggerId);
+      const receivedFinal = liveResult?.pendingFinal;
+      if (liveResult && receivedFinal && (liveResult.status === 'pending'
+        || liveResult.status === 'failed' && liveResult.terminalErrorCode === 'async_result_persistence_failed')) {
+        if (turn.ownerLarkAppId !== ds.larkAppId) throw new Error('Received async final owner mismatch');
+        const completedAt = Date.now();
+        const outcome = asyncTriggerStore.recordCompleted(ds.session.sessionId, triggerId,
+          receivedFinal.content, completedAt, turn.ownerLarkAppId, receivedFinal.usage, 'durable');
+        if (outcome === 'written_completed') {
+          liveResult.status = 'completed';
+          liveResult.content = receivedFinal.content;
+          liveResult.completedAt = completedAt;
+          if (receivedFinal.usage) liveResult.usage = receivedFinal.usage;
+          delete liveResult.pendingFinal;
+        } else ds.asyncTriggerResults?.delete(triggerId);
+        turns.delete(triggerId);
+        convergedAny = true;
+        continue;
+      }
       // recordFailedStrict is itself owner-proofed (throws on owner mismatch) and
       // completed-wins, so a foreign-occupied slot throws here → caught below →
       // entry intact, caller fail-closes. Never clobbers another bot's evidence.

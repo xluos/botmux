@@ -785,6 +785,11 @@ export interface DaemonSession {
     completedAt?: number;
     failedAt?: number;
     content?: string;
+    /** A received final awaiting durable storage. It is stronger than a later
+     * provider failure, while acknowledged cancellation still owns the turn. */
+    pendingFinal?: { content: string; receivedAt: number; usage?: {
+      inputTokens: number; outputTokens: number; cacheReadTokens: number; cacheCreateTokens: number;
+    } };
     errorCode?: 'trigger_failed';
     terminalErrorCode?: string;
     interruptedAt?: number;

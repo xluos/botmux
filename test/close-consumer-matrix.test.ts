@@ -237,6 +237,11 @@ const CONSUMERS: Record<string, Rule> = {
     why: 'Typed consumer: refusal never claims fail-closed, residual uses the '
       + 'background wrapper, and throw is logged as unproven.',
   },
+  'daemon.ts::failCloseIdempotentTurnIfConvergenceWriteFailed::closeSessionForBackgroundCleanup': {
+    category: 'background',
+    why: 'The generation-guarded recovery callback preserves the background wrapper '
+      + 'logging for refusals and residuals. A rejected guard preserves the pending final.',
+  },
   'daemon.ts::closeSession::runWithdrawAutoClose': {
     category: 'background',
     why: 'Typed consumer: refusal returns false, residual is locally closed and '
